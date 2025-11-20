@@ -45,7 +45,10 @@ classifiers = [
     "Typing :: Typed",
 ]
 
-dependencies = ["paddlepaddle-gpu>=3.3.0.dev"]
+dependencies = [
+    "colorlog>=6.10.1",
+    "paddlepaddle-gpu>=3.3.0.dev",
+]
 
 [project.urls]
 Download = "https://github.com/PaddlePaddle/PaddleFleet/releases"
