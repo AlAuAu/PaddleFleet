@@ -362,9 +362,7 @@ class TransformerLayer(GraphableFleetLayer, BaseTransformerLayer):
         # [Layer 8: MLP block]
         additional_mlp_kwargs = {}
 
-        # from paddlefleet.transformer.moe.moe_layer import MoELayer
-        class MoELayer:
-            pass
+        from paddlefleet.transformer.moe.moe_layer import MoELayer
 
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
         # We can change MLP to accept pg_collection but it makes the logic implicit
