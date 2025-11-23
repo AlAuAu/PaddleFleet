@@ -120,6 +120,9 @@ class LanguageLayer(FleetLayer):
             Tensor: Loss tensor of dimensions [batch size, sequence_length]
         """
         loss = self.loss_func(logits.cast("float32"), labels)
+        # loss = tensor_parallel.vocab_parallel_cross_entropy(
+        #     logits.cast("float32"), labels
+        # )
 
         lossmask = labels != self.ignored_index
         if (~lossmask).all():  # empty span

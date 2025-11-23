@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Referred to NVIDIA Megatron-LM https://github.com/NVIDIA/Megatron-LM.git
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,6 +24,7 @@ from typing import TYPE_CHECKING, Literal
 import paddle.nn.functional as F
 
 from ..model_parallel_config import ModelParallelConfig
+from ..utils import init_method_normal, scaled_init_method_normal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -105,7 +110,9 @@ class TransformerConfig(ModelParallelConfig):
 
     init_method: Callable | None = None
     """Method to initialize weights. Note that bias is always set to zero. Should be a function that
-    takes a single Tensor and initializes it. """
+    takes a single Tensor and initializes it. If None, will be set to
+    paddlefleet.utils.init_method_normal(init_method_std) which is paddle nn init normal with
+    mean=0.0 and std=init_method_std."""
 
     kv_channels: int = None
     """Projection weights dimension in multi-head attention. This is set to hidden_size //
@@ -135,7 +142,9 @@ class TransformerConfig(ModelParallelConfig):
     MLP layer)."""
 
     output_layer_init_method: Callable | None = None
-    """Method to initialize weights of the output layer of both attention and MLP blocks. """
+    """Method to initialize weights of the output layer of both attention and MLP blocks. If None,
+    will be set to paddlefleet.utils.scaled_init_method_normal(init_method_std) which is paddle nn
+    init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers)."""
 
     rotary_interleaved: bool = False
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
@@ -176,7 +185,7 @@ class TransformerConfig(ModelParallelConfig):
     masked_softmax_fusion: bool = False
     """If True, uses softmax fusion."""
 
-    fuse_rms_norm: bool = True
+    fuse_rms_norm: bool = False
     """Fused rms norm or not"""
 
     normalization: str = "RMSNorm"
@@ -250,6 +259,35 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
+    ####################
+    # initialization
+    ####################
+    init_method: callable = None
+    """Method to initialize weights. Note that bias is always set to zero. Should be a function that
+    takes a single Tensor and initializes it. If None, will be set to
+    paddlefleet.utils.init_method_normal(init_method_std) which is paddle nn init normal with
+    mean=0.0 and std=init_method_std."""
+
+    output_layer_init_method: callable = None
+    """Method to initialize weights of the output layer of both attention and MLP blocks. If None,
+    will be set to paddlefleet.utils.scaled_init_method_normal(init_method_std) which is paddle nn
+    init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers)."""
+
+    init_method_std: float = 0.02
+    """Standard deviation of the zero mean normal for the default initialization method, not used if
+    init_method and output_layer_init_method are provided."""
+
+    init_model_with_meta_device: bool = False
+    """
+    If True, initializes the model with the meta device. This is helpful for
+    training of very large models. This feature is only works when custom fsdp is turned on.
+    """
+
+    use_cpu_initialization: bool = False
+
+    is_hybrid_model: bool = False
+    """ Indicates whether this is a hybrid model. """
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -273,3 +311,13 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
+
+        if self.init_method is None:
+            self.init_method = init_method_normal(self.init_method_std)
+
+        if self.output_layer_init_method is None:
+            self.output_layer_init_method = scaled_init_method_normal(
+                self.init_method_std,
+                self.num_layers,
+                multiplier=2.0 if not self.is_hybrid_model else 1.0,
+            )
