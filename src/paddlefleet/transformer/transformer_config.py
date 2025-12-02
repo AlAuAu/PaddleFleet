@@ -38,7 +38,7 @@ class TransformerConfig(ModelParallelConfig):
     # model architecture
     ####################
 
-    num_hidden_layers: int = 0
+    num_hidden_layers: int = 1
     """Number of transformer layers in a transformer block."""
 
     num_nextn_predict_layers: int = None
@@ -94,7 +94,7 @@ class TransformerConfig(ModelParallelConfig):
     hidden_size: int = 0
     """Transformer hidden size."""
 
-    num_attention_heads: int = 0
+    num_attention_heads: int = 1
     """Number of transformer attention heads."""
 
     softmax_scale: float = None
@@ -118,10 +118,10 @@ class TransformerConfig(ModelParallelConfig):
     """Projection weights dimension in multi-head attention. This is set to hidden_size //
     num_attention_heads if not provided."""
 
-    hidden_dropout_prob: float = 0.1
+    hidden_dropout_prob: float = 0.0
     """Dropout probability for transformer hidden state."""
 
-    attention_dropout: float = 0.1
+    attention_dropout: float = 0.0
     """Post attention dropout probability."""
 
     intermediate_size: int | None = None
@@ -134,7 +134,7 @@ class TransformerConfig(ModelParallelConfig):
     act_fn: Callable = F.gelu
     """Activation function to use for the non-linearity in the MLP."""
 
-    use_bias: bool = True
+    use_bias: bool = False
     """Include a bias term in all linear layers (QKV projections, after core attention, and two in
     MLP layer)."""
 
@@ -312,6 +312,45 @@ class TransformerConfig(ModelParallelConfig):
 
     is_hybrid_model: bool = False
     """ Indicates whether this is a hybrid model. """
+
+    @classmethod
+    def from_config(cls, config_dict):
+        instance = cls()
+        instance.register_attributes(config_dict)
+        instance.__post_init__()
+        return instance
+
+    def register_attributes(self, config):
+        transform_rules = None
+        if hasattr(self, "transform_rules"):
+            transform_rules = self.transform_rules
+
+        for key, value in config.__dict__.items():
+            if transform_rules and key in transform_rules:
+                self._process_attribute(transform_rules[key], value)
+            else:
+                self._process_attribute(key, value)
+
+    def _process_attribute(self, key, value):
+        if not isinstance(key, str) or not key.isidentifier():
+            print(f"invalid key name: {key}")
+            return
+
+        if key == "activation_func":
+            if isinstance(value, str):
+                func = getattr(F, value)
+                setattr(self, key, func)
+            elif callable(value):
+                setattr(self, key, value)
+            else:
+                raise TypeError(
+                    f"activation_func must be str or callable, but get {type(value)}"
+                )
+        else:
+            setattr(self, key, value)
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
