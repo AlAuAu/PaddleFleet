@@ -128,7 +128,7 @@ class MoELayer(nn.Layer):
         self.expert_dropout = config.get("expert_dropout", 0.0)
 
         self._init_expert_parallel()
-        self.router = StandardMoERouter(
+        self.gate = StandardMoERouter(
             config=config, pg_collection=pg_collection
         )
 
@@ -377,7 +377,7 @@ class MoELayer(nn.Layer):
             priorities,
             aux_loss,
             z_loss,
-        ) = self.router(hidden_states)
+        ) = self.gate(hidden_states)
         # topk_weights, topk_indices will be used in AllToAllMoECommunication
         # gates_masked, mask will be used in DeepEPMoECommunication
         # capacity, priorities are not used currently
