@@ -71,8 +71,27 @@ unset http_proxy https_proxy
 #    run_pretrain.py $config_json \
 #    --output_dir ./checkpoint 2>&1 | tee ./glm45.log
 
+
+set +e
 NNODES=1 MASTER_ADDR=$master MASTER_PORT=$port coverage run $(which paddleformers-cli) train $config_yaml 2>&1 | tee ./glm45_pt.log
 
+exit_code=$?
+if [ $exit_code -ne 0 ]; then
+   echo "GLM4.5 multi-cards training failed, try to check the log file"
+   python $root_dir/PaddleFleet/ci/check_log_for_exitcode.py ./glm45.log
+   check_exit_code=$?
+   if [ $check_exit_code -ne 0 ]; then
+     echo "Failed to find 'Training completed' in log file."
+     exit 1
+   else
+     echo "Log check passed."
+   fi
+else
+    echo "Test passed."
+fi
+
+
+set -e
 echo "
 10 12.66259193
 " > ./glm45_pt_multi_card_gt_loss.txt
