@@ -244,13 +244,14 @@ class MlpNode:
         backward_subbatch_rows=None,
         use_bf16_gemm_weight_grad=False,
         use_fp8_mlp=True,
+        moe_deep_gemm=True,
+        moe_grouped_gemm=False,
     ):
         """
         Constructor
         """
         self.token_dispatcher = custom_map.token_dispatcher
         self.moe_expert_fusion = moe_expert_fusion
-        self.experts = custom_map.experts
         if recompute_moe_premute:
             assert moe_expert_fusion, (
                 "moe_expert_fusion must be enabled when recompute_moe_premute = True"
@@ -310,6 +311,8 @@ class MlpNode:
                 backward_subbatch_rows=backward_subbatch_rows,
                 use_bf16_gemm_weight_grad=use_bf16_gemm_weight_grad,
                 use_fp8_mlp=use_fp8_mlp,
+                moe_deep_gemm=moe_deep_gemm,
+                moe_grouped_gemm=moe_grouped_gemm,
             )
         self.unzip_node = UnZipNode(self.token_dispatcher)
         self.zip_node = ZipNode(self.token_dispatcher)
@@ -595,6 +598,8 @@ class FusionMoePyLayer(paddle.autograd.PyLayer):
         custom_map,
         num_experts_per_tok,
         use_fp8_mlp=True,
+        moe_deep_gemm=True,
+        moe_grouped_gemm=False,
         recompute_moe_gate_up=False,
         dequant_input=True,
         moe_expert_fusion=False,
@@ -630,6 +635,8 @@ class FusionMoePyLayer(paddle.autograd.PyLayer):
             backward_subbatch_rows=backward_subbatch_rows,
             use_bf16_gemm_weight_grad=use_bf16_gemm_weight_grad,
             use_fp8_mlp=use_fp8_mlp,
+            moe_deep_gemm=moe_deep_gemm,
+            moe_grouped_gemm=moe_grouped_gemm,
         )
 
         if fp8_dispatched_handle is not None:
