@@ -236,7 +236,6 @@ jobs:
           uv run coverage combine
           uv run coverage xml -o /paddle/coveragedata/coverage.xml
           uv run coverage report -m
-
           if [[ "$multi_card_exit_code" != "0" ]]; then
             echo -e "::error:: \033[31mMulti card test failed.\033[0m"
             exit 1
