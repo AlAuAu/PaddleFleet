@@ -14,7 +14,6 @@ on:
         type: string
 
 
-
 permissions: read-all
 
 concurrency:
@@ -78,8 +77,8 @@ jobs:
             -e PR_ID \
             -e COMMIT_ID \
             -e BRANCH \
-            -e AK=${{ secrets.BOS_CREDENTIAL_AK }} \
-            -e SK=${{ secrets.BOS_CREDENTIAL_SK }} \
+            -e AK=paddle \
+            -e SK=paddle \
             -e GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
             -e GITHUB_REPO_NAME=${{ github.repository }} \
             -w /workspace --network=host $docker_image
