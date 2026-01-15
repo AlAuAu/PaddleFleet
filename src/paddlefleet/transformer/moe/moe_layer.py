@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 import paddle
 from paddle import nn
+from paddle.autograd import PyLayer
 from paddle.distributed.fleet.utils.sequence_parallel_utils import (
     GatherOp,
     ScatterOp,
@@ -58,6 +59,36 @@ from .moe_utils import (
     permute,
     unpermute,
 )
+
+
+class GradDtypeGuard(PyLayer):
+    """Guard the grad's dtype if different from input's dtype."""
+
+    @staticmethod
+    def forward(ctx, x, dtype):
+        """forward"""
+        return paddle.empty([0], dtype=dtype), {"x": x}
+
+    @staticmethod
+    def backward(ctx, grad):
+        """backward"""
+        return grad
+
+
+class GradDtypeUnguard(PyLayer):
+    """Remove grad dtype guard."""
+
+    @staticmethod
+    def forward(ctx, x, status):
+        """forward"""
+        if hasattr(ctx, "set_grad_in_dtype_consistent"):
+            ctx.set_grad_in_dtype_consistent(False)
+        return status["x"]
+
+    @staticmethod
+    def backward(ctx, grad):
+        """backward"""
+        return grad
 
 
 @dataclass
@@ -533,12 +564,19 @@ class MoELayer(nn.Layer):
             tokens_per_expert = (
                 self.token_dispatcher._comm_manager.tokens_per_expert
             )
+            # dispatched_hidden_states's dtype is fp8, but its gradient's dtype is bf16, so type separation is required; the actual values are passed via a dictionary.
+            dispatched_hidden_states, guard_status = GradDtypeGuard.apply(
+                dispatched_hidden_states, hidden_states.dtype
+            )
+            guard_status["x"].stop_gradient = True
+
             return (
                 dispatched_hidden_states,
                 dispatched_indices,
                 dispatched_probs,
                 fp8_dispatched_handle,
                 tokens_per_expert,
+                guard_status,
             )
 
     def compute_experts(self, args, is_first_fwd=False):
@@ -549,9 +587,13 @@ class MoELayer(nn.Layer):
                 dispatched_probs,
                 fp8_dispatched_handle,
                 tokens_per_expert,
+                guard_status,
             ) = args
             self.token_dispatcher._comm_manager.tokens_per_expert = (
                 tokens_per_expert
+            )
+            dispatched_hidden_states = GradDtypeUnguard.apply(
+                dispatched_hidden_states, guard_status
             )
             hidden_states = FusionMoePyLayer.apply(
                 dispatched_hidden_states,

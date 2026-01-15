@@ -58,7 +58,11 @@ def tensors_clone(outputs):
                 res_item = item.clone()
                 res.append(res_item)
             else:
-                res.append(item)
+                if isinstance(item, dict):
+                    res_item = tensors_clone(item)
+                    res.append(res_item)
+                else:
+                    res.append(item)
         if isinstance(outputs, tuple):
             return tuple(res)
         else:
