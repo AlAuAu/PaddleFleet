@@ -623,6 +623,9 @@ class TransformerLayerWithOverlap(TransformerLayer):
         assert not self.recompute_input_layernorm
         assert not self.recompute_post_attention_layernorm
         if isinstance(self.mlp, MoELayer):
+            assert not self.mlp.gate.norm_topk_prob, (
+                "By enabling `forward_backward_overlap_scheduler`, you should not use `norm_topk_prob` in TopKRouter."
+            )
             assert self.mlp.expert_model_parallel_size > 1, (
                 "By enabling `forward_backward_overlap_scheduler`, you should use expert parallel."
             )
