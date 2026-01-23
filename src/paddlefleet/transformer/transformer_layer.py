@@ -656,18 +656,26 @@ class TransformerLayerWithOverlap(TransformerLayer):
             residuals,
             topk_weights,
             topk_indices,
+            gates_masked,
+            mask,
             aux_loss,
         )
 
     def dispatch_preprocess_compute(self, args):
-        hidden_states, topk_weights, topk_indices = args
+        hidden_states, token_indices, token_weights, gates_masked, mask = args
 
-        hidden_states, token_indices, token_weights = (
+        hidden_states, token_indices, token_weights, gates_masked, mask = (
             self.mlp.dispatch_preprocess(
-                (hidden_states, topk_weights, topk_indices)
+                (
+                    hidden_states,
+                    token_indices,
+                    token_weights,
+                    gates_masked,
+                    mask,
+                )
             )
         )
-        return hidden_states, token_indices, token_weights
+        return hidden_states, token_indices, token_weights, gates_masked, mask
 
     def post_process_compute(self, args, is_first_fwd=False):
         mlp_output, residual = args
@@ -743,19 +751,33 @@ class TransformerLayerNode(ScheduleNode):
                 residual,
                 hidden_states,
                 residuals,
-                topk_weights,
-                topk_indices,
+                token_weights,
+                token_indices,
+                gates_masked,
+                mask,
                 aux_loss,
             ) = self.pre_process_node.forward(hidden_states)
 
-            hidden_states, token_indices, token_weights = (
+            hidden_states, token_indices, token_weights, gates_masked, mask = (
                 self.dispatch_preprocess_node.forward(
-                    (hidden_states, topk_weights, topk_indices)
+                    (
+                        hidden_states,
+                        token_indices,
+                        token_weights,
+                        gates_masked,
+                        mask,
+                    )
                 )
             )
 
             hidden_states = self.dispatch_node.forward(
-                (hidden_states, token_indices, token_weights),
+                (
+                    hidden_states,
+                    token_indices,
+                    token_weights,
+                    gates_masked,
+                    mask,
+                ),
                 async_finish=True,
             )
             dispatch_fw_event = deep_ep.get_event_from_comm_stream(
@@ -832,9 +854,12 @@ class TransformerLayerNode(ScheduleNode):
             combine_bw_event.calc_stream_wait(self.group_id)
             output_grad = self.mlp_node.backward(output_grad)
 
-            (output_grad, token_indices_grad, token_weights_grad) = (
-                self.dispatch_node.backward(output_grad)
-            )
+            (
+                output_grad,
+                token_indices_grad,
+                token_weights_grad,
+                gates_masked_grad,
+            ) = self.dispatch_node.backward(output_grad)
             dispatch_bw_event = deep_ep.get_event_from_comm_stream(
                 self.group_id
             )
@@ -842,10 +867,16 @@ class TransformerLayerNode(ScheduleNode):
 
             (
                 output_grad,
-                topk_weights_grad,
-                topk_indices_grad,
+                token_indices_grad,
+                token_weights_grad,
+                gates_masked_grad,
             ) = self.dispatch_preprocess_node.backward(
-                (output_grad, token_indices_grad, token_weights_grad)
+                (
+                    output_grad,
+                    token_indices_grad,
+                    token_weights_grad,
+                    gates_masked_grad,
+                )
             )
 
             output_grad = self.pre_process_node.backward(
@@ -853,8 +884,9 @@ class TransformerLayerNode(ScheduleNode):
                     residual_grad,
                     output_grad,
                     residuals_grad,
-                    topk_weights_grad,
-                    topk_indices_grad,
+                    token_weights_grad,
+                    token_indices_grad,
+                    gates_masked_grad,
                     aux_loss_grad,
                 )
             )
@@ -943,20 +975,34 @@ class TransformerLayerOverlappedScheduleNode(ScheduleNode):
                 residual,
                 hidden_states,
                 residuals,
-                topk_weights,
-                topk_indices,
+                token_weights,
+                token_indices,
+                gates_masked,
+                mask,
                 aux_loss,
             ) = self.forward_node.pre_process_node.forward(hidden_states)
 
-            hidden_states, token_indices, token_weights = (
+            hidden_states, token_indices, token_weights, gates_masked, mask = (
                 self.forward_node.dispatch_preprocess_node.forward(
-                    (hidden_states, topk_weights, topk_indices)
+                    (
+                        hidden_states,
+                        token_indices,
+                        token_weights,
+                        gates_masked,
+                        mask,
+                    )
                 )
             )
 
             # 4. DISPATCH(F)
             hidden_states = self.forward_node.dispatch_node.forward(
-                (hidden_states, token_indices, token_weights),
+                (
+                    hidden_states,
+                    token_indices,
+                    token_weights,
+                    gates_masked,
+                    mask,
+                ),
                 async_finish=True,
             )
             dispatch_fw_event = deep_ep.get_event_from_comm_stream(
@@ -968,9 +1014,12 @@ class TransformerLayerOverlappedScheduleNode(ScheduleNode):
             output_grad = self.backward_node.mlp_node.backward(output_grad)
 
             # 6. DISPATCH(B)
-            output_grad, token_indices_grad, token_weights_grad = (
-                self.backward_node.dispatch_node.backward(output_grad)
-            )
+            (
+                output_grad,
+                token_indices_grad,
+                token_weights_grad,
+                gates_masked_grad,
+            ) = self.backward_node.dispatch_node.backward(output_grad)
             dispatch_bw_event = deep_ep.get_event_from_comm_stream(
                 self.backward_node.group_id
             )
@@ -996,10 +1045,16 @@ class TransformerLayerOverlappedScheduleNode(ScheduleNode):
             dispatch_bw_event.calc_stream_wait(self.backward_node.group_id)
             (
                 output_grad,
-                topk_weights_grad,
-                topk_indices_grad,
+                token_indices_grad,
+                token_weights_grad,
+                gates_masked_grad,
             ) = self.backward_node.dispatch_preprocess_node.backward(
-                (output_grad, token_indices_grad, token_weights_grad)
+                (
+                    output_grad,
+                    token_indices_grad,
+                    token_weights_grad,
+                    gates_masked_grad,
+                )
             )
 
             output_grad = self.backward_node.pre_process_node.backward(
@@ -1007,8 +1062,9 @@ class TransformerLayerOverlappedScheduleNode(ScheduleNode):
                     residual_grad,
                     output_grad,
                     residuals_grad,
-                    topk_weights_grad,
-                    topk_indices_grad,
+                    token_weights_grad,
+                    token_indices_grad,
+                    gates_masked_grad,
                     aux_loss_grad,
                 )
             )
