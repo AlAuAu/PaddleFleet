@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 import paddle
 from paddle import Tensor
+from paddle.distributed.fleet.utils import recompute
 
 from paddlefleet import tensor_parallel
 from paddlefleet.pipeline_parallel import ScheduleNode
@@ -263,6 +264,7 @@ class MultiTokenPredictionLayer(FleetLayer):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.sequence_parallel = config.sequence_parallel
+        self.tensor_parallel = config.tensor_model_parallel_size
         self.sublayers_spec = sublayers_spec
         self.layer_number = layer_number
         self.cp_group = pg_collection.cp
@@ -339,7 +341,10 @@ class MultiTokenPredictionLayer(FleetLayer):
         # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
         # the gradient in backward pass and was therefore incorrect in this context.
         # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-        hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
+        if self.tensor_parallel > 1:
+            hidden_states = gather_from_tensor_model_parallel_region(
+                hidden_states
+            )
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
             hidden_states = scatter_to_sequence_parallel_region(hidden_states)
@@ -394,11 +399,44 @@ class MultiTokenPredictionLayer(FleetLayer):
     def _checkpointed_forward(self, forward_func, *args, **kwargs):
         def checkpoint_handler():
             """Determines whether to use the `tensor_parallel.checkpoint`"""
-            return tensor_parallel.checkpoint(
+            hidden_states = kwargs.get("hidden_states", None)
+            decoder_input = kwargs.get("decoder_input", None)
+            attention_mask = kwargs.get("attention_mask", None)
+            context = kwargs.get("context", None)
+            context_mask = kwargs.get("context_mask", None)
+            rotary_pos_emb = kwargs.get("rotary_pos_emb", None)
+            rotary_pos_cos = kwargs.get("rotary_pos_cos", None)
+            rotary_pos_sin = kwargs.get("rotary_pos_sin", None)
+            attention_bias = kwargs.get("attention_bias", None)
+            packed_seq_params = kwargs.get("packed_seq_params", None)
+            return recompute(
                 forward_func,
-                self.config.distribute_saved_activations,
-                *args,
-                *kwargs.values(),
+                hidden_states=hidden_states
+                if hidden_states is not None
+                else None,
+                decoder_input=decoder_input
+                if decoder_input is not None
+                else None,
+                attention_mask=attention_mask
+                if attention_mask is not None
+                else None,
+                context=context if context is not None else None,
+                context_mask=context_mask if context_mask is not None else None,
+                rotary_pos_emb=rotary_pos_emb
+                if rotary_pos_emb is not None
+                else None,
+                rotary_pos_cos=rotary_pos_cos
+                if rotary_pos_cos is not None
+                else None,
+                rotary_pos_sin=rotary_pos_sin
+                if rotary_pos_sin is not None
+                else None,
+                attention_bias=attention_bias
+                if attention_bias is not None
+                else None,
+                packed_seq_params=packed_seq_params
+                if packed_seq_params is not None
+                else None,
             )
 
         if self.config.recompute_method == "uniform":

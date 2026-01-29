@@ -374,6 +374,7 @@ class TransformerLayer(nn.Layer):
             and self.config.num_nextn_predict_layers > 0
             and not is_mtp
         ):
+            # process hidden_states
             hidden_states_concat = dict_args["hidden_states"]
             tensor_list = paddle.split(
                 hidden_states_concat, self.config.num_nextn_predict_layers + 1
@@ -381,6 +382,36 @@ class TransformerLayer(nn.Layer):
             hidden_states = tensor_list[0]
             mtp_input = tuple(tensor_list[1:])
             dict_args["hidden_states"] = hidden_states
+
+            # process position_ids
+            if "position_ids" in dict_args.keys():
+                position_ids = dict_args["position_ids"]
+                decoder_ids = position_ids[
+                    :, : -self.config.num_nextn_predict_layers
+                ]
+                mtp_ids = position_ids[
+                    :, -self.config.num_nextn_predict_layers :
+                ]
+                dict_args["position_ids"] = decoder_ids
+
+            # #process attn_mask_startend_row_indices
+            if "attn_mask_startend_row_indices" in dict_args.keys():
+                attn_mask_startend_row_indices = dict_args[
+                    "attn_mask_startend_row_indices"
+                ]
+                attn_mask_startend_row_indices_decoder = (
+                    attn_mask_startend_row_indices[
+                        :, :, : -self.config.num_nextn_predict_layers, :
+                    ]
+                )
+                attn_mask_startend_row_indices_mtp = (
+                    attn_mask_startend_row_indices[
+                        :, :, -self.config.num_nextn_predict_layers :, :
+                    ]
+                )
+                dict_args["attn_mask_startend_row_indices"] = (
+                    attn_mask_startend_row_indices_decoder
+                )
 
         if self.full_recompute:
             hidden_states = dict_args["hidden_states"]
@@ -437,6 +468,24 @@ class TransformerLayer(nn.Layer):
         ):
             hidden_states_concat = paddle.concat([output, *mtp_input])
             rst["hidden_states"] = hidden_states_concat
+
+            if "position_ids" in dict_args.keys():
+                position_ids = paddle.concat(
+                    [dict_args["position_ids"], mtp_ids], axis=1
+                )
+                dict_args["position_ids"] = position_ids
+
+            if "attn_mask_startend_row_indices" in dict_args.keys():
+                attn_mask_startend_row_indices = paddle.concat(
+                    [
+                        dict_args["attn_mask_startend_row_indices"],
+                        attn_mask_startend_row_indices_mtp,
+                    ],
+                    axis=2,
+                )
+                rst["attn_mask_startend_row_indices"] = (
+                    attn_mask_startend_row_indices
+                )
         if context is not None:
             rst["context"] = context
         rst = {**dict_args, **rst}
