@@ -60,12 +60,6 @@ jobs:
             python: "3.12"
           - cuda: "12.6"
             python: "3.13"
-          - cuda: "12.9"
-            python: "3.11"
-          - cuda: "12.9"
-            python: "3.12"
-          - cuda: "12.9"
-            python: "3.13"
           - cuda: "13.0"
             python: "3.11"
           - cuda: "13.0"
@@ -173,7 +167,7 @@ jobs:
           pip install colorlog>=6.10.1
           fleet_wheel=paddlefleet-0.0.0-cp${PYTHON_VERSION//./}-cp${PYTHON_VERSION//./}-linux_x86_64.whl
           wget "${paddlefleet_url}${CUDA_VERSION}/${fleet_wheel}" -O ${fleet_wheel}
-          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://www.paddlepaddle.org.cn/packages/nightly/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
           if [ "${use_release}" == "true" ]; then
             echo "Using release paddle package"
             pip install ${paddle_url} --index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --force-reinstall --no-cache-dir
@@ -185,6 +179,29 @@ jobs:
           python -c "import paddlefleet; print(paddlefleet.version.commit)"
           export PYTHONPATH=/paddle/PaddleFleet:$PYTHONPATH
           bash ci/single_card_test.sh
+          single_card_exit_code=$?
+          if [[ "$single_card_exit_code" != "0" ]]; then
+            echo -e "::error:: \033[31mSingle card test failed.\033[0m"
+            exit 1
+          else
+            echo -e "\033[32mSingle card test succeeded.\033[0m"
+          fi
+          '
+
+      - name: Single card sonic moe test
+        if: matrix.python == '3.12' && matrix.cuda == '12.9' && always()
+        run: |
+          docker exec -t ${{ env.container_name }} /bin/bash -xce '
+          pwd
+          source /root/proxy
+          source "$HOME/miniconda/etc/profile.d/conda.sh"
+          conda activate python${{ matrix.python }}
+          echo "Paddle Commit"
+          python -c "import paddle; print(paddle.version.commit)"
+          echo "PaddleFleet Commit"
+          python -c "import paddlefleet; print(paddlefleet.version.commit)"
+          cd PaddleFleet
+          bash ci/single_card_sonic.sh
           single_card_exit_code=$?
           if [[ "$single_card_exit_code" != "0" ]]; then
             echo -e "::error:: \033[31mSingle card test failed.\033[0m"
@@ -215,12 +232,6 @@ jobs:
           - cuda: "12.6"
             python: "3.12"
           - cuda: "12.6"
-            python: "3.13"
-          - cuda: "12.9"
-            python: "3.11"
-          - cuda: "12.9"
-            python: "3.12"
-          - cuda: "12.9"
             python: "3.13"
           - cuda: "13.0"
             python: "3.11"
@@ -326,7 +337,7 @@ jobs:
           pip install colorlog>=6.10.1
           fleet_wheel=paddlefleet-0.0.0-cp${PYTHON_VERSION//./}-cp${PYTHON_VERSION//./}-linux_x86_64.whl
           wget "${paddlefleet_url}${CUDA_VERSION}/${fleet_wheel}" -O ${fleet_wheel}
-          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://www.paddlepaddle.org.cn/packages/nightly/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
           if [ "${use_release}" == "true" ]; then
             echo "Using release paddle package"
             pip install ${paddle_url} --index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --force-reinstall --no-cache-dir
@@ -337,7 +348,7 @@ jobs:
           echo "PaddleFleet Commit"
           python -c "import paddlefleet; print(paddlefleet.version.commit)"
           export PYTHONPATH=/paddle/PaddleFleet:$PYTHONPATH
-          bash ci/multi_card_test.sh
+          bash PaddleFleet/ci/multi-card_test.sh
           multi_card_exit_code=$?
           if [[ "$multi_card_exit_code" != "0" ]]; then
             echo -e "::error:: \033[31mMulti card test failed.\033[0m"
@@ -368,12 +379,6 @@ jobs:
           - cuda: "12.6"
             python: "3.12"
           - cuda: "12.6"
-            python: "3.13"
-          - cuda: "12.9"
-            python: "3.11"
-          - cuda: "12.9"
-            python: "3.12"
-          - cuda: "12.9"
             python: "3.13"
           - cuda: "13.0"
             python: "3.11"
@@ -481,7 +486,7 @@ jobs:
           pip install colorlog>=6.10.1
           fleet_wheel=paddlefleet-0.0.0-cp${PYTHON_VERSION//./}-cp${PYTHON_VERSION//./}-linux_x86_64.whl
           wget "${paddlefleet_url}${CUDA_VERSION}/${fleet_wheel}" -O ${fleet_wheel}
-          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://www.paddlepaddle.org.cn/packages/nightly/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
           echo "Using release paddlefleet package"
           wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
           chmod +x /usr/local/bin/yq
@@ -583,7 +588,7 @@ jobs:
           source /root/proxy
           source "$HOME/miniconda/etc/profile.d/conda.sh"
           conda activate python${PYTHON_VERSION}
-          bash -x PaddleFormers/tests/integration_test/qwen3vl_sft_single_card.sh
+          bash -x PaddleFormers/tests/integration_test/qwen3vl_sft_single_card.sh single
           exit_code=$?
           if [[ "$exit_code" != "0" ]]; then
             export case_name="qwen3vl_sft_single_card"
@@ -614,12 +619,6 @@ jobs:
           - cuda: "12.6"
             python: "3.12"
           - cuda: "12.6"
-            python: "3.13"
-          - cuda: "12.9"
-            python: "3.11"
-          - cuda: "12.9"
-            python: "3.12"
-          - cuda: "12.9"
             python: "3.13"
           - cuda: "13.0"
             python: "3.11"
@@ -722,7 +721,7 @@ jobs:
           pip install colorlog>=6.10.1
           fleet_wheel=paddlefleet-0.0.0-cp${PYTHON_VERSION//./}-cp${PYTHON_VERSION//./}-linux_x86_64.whl
           wget "${paddlefleet_url}${CUDA_VERSION}/${fleet_wheel}" -O ${fleet_wheel}
-          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://www.paddlepaddle.org.cn/packages/nightly/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
           echo "Using release paddlefleet package"
           wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
           chmod +x /usr/local/bin/yq
@@ -868,6 +867,40 @@ jobs:
           fi
           '
 
+      - name: Integration test (GLM4.5 multi-card FP8)
+        if: (success() || failure()) && steps.formers_install.conclusion == 'success'
+        run: |
+          docker exec -t ${{ env.container_name }} /bin/bash -c '
+          source /root/proxy
+          source "$HOME/miniconda/etc/profile.d/conda.sh"
+          conda activate python${PYTHON_VERSION}
+          bash -x PaddleFormers/tests/integration_test/glm45_pt_fp8.sh
+          glm45_exit_code=$?
+          if [[ "$glm45_exit_code" != "0" ]]; then
+            export case_name="glm45_pt_fp8"
+            bash PaddleFleet/ci/check_ce_precision.sh $case_name $BASE_NAME
+          else
+            echo -e "\033[32mIntegration test succeeded: GLM4.5 FP8.\033[0m"
+          fi
+          '
+
+      - name: GLM4.5 pre-train (EP4)
+        if: (success() || failure()) && steps.formers_install.conclusion == 'success'
+        run: |
+          docker exec -t ${{ env.container_name }} /bin/bash -c '
+          source /root/proxy
+          source "$HOME/miniconda/etc/profile.d/conda.sh"
+          conda activate python${PYTHON_VERSION}
+          bash -x PaddleFormers/tests/integration_test/glm45_pt_ep4.sh
+          glm45_exit_code=$?
+          if [[ "$glm45_exit_code" != "0" ]]; then
+            export case_name="glm45_pt_ep4"
+            bash PaddleFleet/ci/check_ce_precision.sh $case_name $BASE_NAME
+          else
+            echo -e "\033[32mIntegration test succeeded: GLM4.5 EP4.\033[0m"
+          fi
+          '
+
       - name: Qwen pre-train
         if: (success() || failure()) && steps.formers_install.conclusion == 'success'
         run: |
@@ -997,7 +1030,7 @@ jobs:
   integration-test-a100:
     name: Integration test (A100)
     runs-on:
-      group: Fleet-A100
+      group: Distribute
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -1008,12 +1041,6 @@ jobs:
           - cuda: "12.6"
             python: "3.12"
           - cuda: "12.6"
-            python: "3.13"
-          - cuda: "12.9"
-            python: "3.11"
-          - cuda: "12.9"
-            python: "3.12"
-          - cuda: "12.9"
             python: "3.13"
           - cuda: "13.0"
             python: "3.11"
@@ -1116,7 +1143,7 @@ jobs:
           pip install colorlog>=6.10.1
           fleet_wheel=paddlefleet-0.0.0-cp${PYTHON_VERSION//./}-cp${PYTHON_VERSION//./}-linux_x86_64.whl
           wget "${paddlefleet_url}${CUDA_VERSION}/${fleet_wheel}" -O ${fleet_wheel}
-          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+          pip install ${fleet_wheel} --extra-index-url=https://www.paddlepaddle.org.cn/packages/stable/${CUDA_VERSION}/ --extra-index-url https://www.paddlepaddle.org.cn/packages/nightly/${CUDA_VERSION}/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
           echo "Using release paddlefleet package"
           wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
           chmod +x /usr/local/bin/yq
@@ -1167,7 +1194,7 @@ jobs:
           source /root/proxy
           source "$HOME/miniconda/etc/profile.d/conda.sh"
           conda activate python${PYTHON_VERSION}
-          bash -x PaddleFormers/tests/integration_test/glm45_pt.sh a100
+          bash -x PaddleFormers/tests/integration_test/glm45_a100.sh pt
           exit_code=$?
           if [ ${exit_code} -ne 0 ]; then
             export case_name="glm45_pt_multi_card_a100"
@@ -1184,7 +1211,7 @@ jobs:
           source /root/proxy
           source "$HOME/miniconda/etc/profile.d/conda.sh"
           conda activate python${PYTHON_VERSION}
-          bash -x PaddleFormers/tests/integration_test/glm45_sft.sh a100
+          bash -x PaddleFormers/tests/integration_test/glm45_a100.sh sft
           exit_code=$?
           if [ ${exit_code} -ne 0 ]; then
             export case_name="glm45_sft_multi_card_a100"
@@ -1201,7 +1228,7 @@ jobs:
           source /root/proxy
           source "$HOME/miniconda/etc/profile.d/conda.sh"
           conda activate python${PYTHON_VERSION}
-          bash -x PaddleFormers/tests/integration_test/glm45_lora.sh a100
+          bash -x PaddleFormers/tests/integration_test/glm45_a100.sh lora
           exit_code=$?
           if [ ${exit_code} -ne 0 ]; then
             export case_name="glm45_lora_multi_card_a100"
@@ -1218,7 +1245,7 @@ jobs:
           source /root/proxy
           source "$HOME/miniconda/etc/profile.d/conda.sh"
           conda activate python${PYTHON_VERSION}
-          bash -x PaddleFormers/tests/integration_test/glm45_dpo.sh a100
+          bash -x PaddleFormers/tests/integration_test/glm45_a100.sh dpo
           exit_code=$?
           if [ ${exit_code} -ne 0 ]; then
             export case_name="glm45_dpo_multi_card_a100"
@@ -1235,7 +1262,7 @@ jobs:
           source /root/proxy
           source "$HOME/miniconda/etc/profile.d/conda.sh"
           conda activate python${PYTHON_VERSION}
-          bash -x PaddleFormers/tests/integration_test/glm45_dpo_lora.sh a100
+          bash -x PaddleFormers/tests/integration_test/glm45_a100.sh dpo_lora
           exit_code=$?
           if [ ${exit_code} -ne 0 ]; then
             export case_name="glm45_dpo_lora_multi_card_a100"
@@ -1252,7 +1279,7 @@ jobs:
           source /root/proxy
           source "$HOME/miniconda/etc/profile.d/conda.sh"
           conda activate python${PYTHON_VERSION}
-          bash -x PaddleFormers/tests/integration_test/qwen.sh pt a100
+          bash -x PaddleFormers/tests/integration_test/qwen3_a100.sh pt
           exit_code=$?
           if [ ${exit_code} -ne 0 ]; then
             export case_name="qwen_pt_multi_card_a100"
@@ -1269,7 +1296,7 @@ jobs:
           source /root/proxy
           source "$HOME/miniconda/etc/profile.d/conda.sh"
           conda activate python${PYTHON_VERSION}
-          bash -x PaddleFormers/tests/integration_test/qwen.sh sft a100
+          bash -x PaddleFormers/tests/integration_test/qwen3_a100.sh sft
           exit_code=$?
           if [ ${exit_code} -ne 0 ]; then
             export case_name="qwen_sft_multi_card_a100"
@@ -1286,7 +1313,7 @@ jobs:
           source /root/proxy
           source "$HOME/miniconda/etc/profile.d/conda.sh"
           conda activate python${PYTHON_VERSION}
-          bash -x PaddleFormers/tests/integration_test/qwen.sh lora a100
+          bash -x PaddleFormers/tests/integration_test/qwen3_a100.sh lora
           exit_code=$?
           if [ ${exit_code} -ne 0 ]; then
             export case_name="qwen_lora_multi_card_a100"
