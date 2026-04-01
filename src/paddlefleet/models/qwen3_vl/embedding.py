@@ -210,12 +210,15 @@ class VisionEmbedding(FleetLayer):
         cu_seqlens = F.pad(cu_seqlens.unsqueeze(0), [1, 0], value=0).squeeze(0)
 
         max_seqlen = seqlens.max().item()
+        total_seqlen = cu_seqlens[-1].item()
 
         return PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            total_seqlen_q=total_seqlen,
+            total_seqlen_kv=total_seqlen,
             qkv_format="thd",
         )
 
