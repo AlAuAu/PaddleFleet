@@ -88,6 +88,7 @@ from .moe_utils import (
     fused_expert_parallel_TC_topk_router_metadata,
     global_moe_balance_training_logs_enabled,
     log_moe_balance,
+    log_moe_losses,
     permute,
     unpermute,
 )
@@ -744,6 +745,8 @@ class MoELayer(nn.Layer):
 
         _log_moe_md5(gates_masked, "gates_masked", layer_idx)
         _log_moe_md5(mask, "routing_mask", layer_idx)
+        if framework._dygraph_tracer()._has_grad:
+            log_moe_losses(layer_idx, aux_loss=aux_loss, z_loss=z_loss)
 
         if (
             self.shared_experts is not None
