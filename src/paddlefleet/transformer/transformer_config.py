@@ -407,8 +407,22 @@ class TransformerConfig(ModelParallelConfig):
     """Number of selected groups per token for expert selection."""
 
     routed_scaling_factor: float = 1.0
-    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
-    enabled. Defaults to None, which means no scaling."""
+    """Scalar multiplier applied to the selected top-k routing weights after expert selection.
+    The final scaled weights are used in ``top_gate`` (``[S, K]``), which is passed to the
+    dispatch/combine flow for expert output weighting.
+
+    Default is ``1.0`` (no scaling effect). For example, set to ``2.5`` for DeepSeek-V3 to
+    compensate for sigmoid scores not summing to 1 after top-k selection.
+
+    When ``routed_scaling_factor_learnable=True``, this value is used as the initialization
+    value for the per-expert learnable parameter."""
+
+    routed_scaling_factor_learnable: bool = False
+    """Whether to use a learnable per-expert scaling parameter instead of a fixed scalar.
+
+    - ``False`` (default): apply ``routed_scaling_factor`` as a fixed scalar uniformly.
+    - ``True``: create a trainable parameter of shape ``[num_experts]``, initialized to
+      ``routed_scaling_factor``, and apply it via per-expert lookup after top-k selection."""
 
     moe_dequant_input: bool = False
     """Whether to dequantize input."""
