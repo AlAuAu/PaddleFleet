@@ -26,6 +26,7 @@ from paddle.distributed.fleet.utils.sequence_parallel_utils import (
     ScatterOp,
 )
 
+from paddlefleet.models.gpt.utils import fill_feature
 from paddlefleet.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
@@ -138,6 +139,10 @@ class GPTEmbedding(FleetLayer):
                 "input_ids or decoder_input must be provided"
             )
             decoder_input = dict_args["decoder_input"]
+
+        # The input_ids_for_moe_mask for moe router is same as input_ids.
+        # The moe router will use it to generate the padding mask for the current sequence.
+        input_ids_for_moe_mask = None
         if decoder_input is None:
             decoder_input = self.embedding(
                 input_ids=input_ids,
@@ -145,6 +150,16 @@ class GPTEmbedding(FleetLayer):
                 if self.multimodal_embedding
                 else position_ids,
             )
+            # Padding-Token is 0，avoiding Grad updating (ernie_core fill_feature func）
+            if (
+                self.config.expert_model_parallel_size > 1
+                and self.config.tensor_model_parallel_size < 2
+            ):
+                text_padding_indices = input_ids == 0
+                decoder_input = fill_feature(
+                    decoder_input, text_padding_indices, 0
+                )
+                input_ids_for_moe_mask = input_ids
             if (
                 self.config.num_nextn_predict_layers is not None
                 and self.config.num_nextn_predict_layers > 0
@@ -369,6 +384,7 @@ class GPTEmbedding(FleetLayer):
             "deepstack_visual_emb": deepstack_visual_embeds,
             "visual_pos_masks": visual_pos_masks,
             "labels": labels,
+            "input_ids": input_ids_for_moe_mask,
         }
         # New dataflow: pass mtp_startend_row_indices_all and mtp_hidden_inputs_mask_all
         # through dict_args to MTP layer. They must both be present or both be absent.
