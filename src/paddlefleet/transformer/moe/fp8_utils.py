@@ -305,7 +305,7 @@ class ExpertsGroupGemmContiguousNode:
         moe_subbatch_token_num_after_dispatch=None,
         use_bf16_gemm_weight_grad=False,
         use_fp8_mlp=True,
-        moe_deep_gemm=True,
+        moe_deep_gemm=False,
         moe_grouped_gemm=False,
     ):
         """
@@ -317,7 +317,7 @@ class ExpertsGroupGemmContiguousNode:
             dequant_input (bool, optional): Whether to dequantize input. Defaults to False.
             name (str, optional): Name of the node. Defaults to "experts_group_gemm_contiguous_node".
         """
-        if not moe_grouped_gemm or use_fp8_mlp:
+        if not moe_grouped_gemm or (use_fp8_mlp and not moe_deep_gemm):
             if expert_id is None:
                 self.experts = custom_map.experts
             else:
@@ -488,6 +488,22 @@ class ExpertsGroupGemmContiguousNode:
         if self.moe_grouped_gemm:
             self.m_indices = self.gen_m_indices(tokens_per_expert)
         # concat w1, shape is [num_groups, n, k]
+
+        if hasattr(self, "grouped_gemm_experts"):
+            offline_quant = hasattr(
+                self.grouped_gemm_experts.weight1,
+                "fp8_weight_stacked_transpose",
+            ) or hasattr(
+                self.grouped_gemm_experts.weight1, "fp8_weight_stacked"
+            )
+            if not offline_quant:
+                local_expert_num = expert_w1.shape[0]
+                expert_w1 = [
+                    expert_w1[i, :, :] for i in range(local_expert_num)
+                ]
+            else:
+                expert_w1 = [expert_w1]
+
         w1_t_quant, w1_t_scale = fused_stack_quant(expert_w1, transpose=True)
         w1_t_quant = w1_t_quant.reshape([num_expert, -1, w1_t_quant.shape[-1]])
         w1_t_scale = w1_t_scale.reshape([num_expert, -1, w1_t_scale.shape[-1]])
@@ -618,6 +634,22 @@ class ExpertsGroupGemmContiguousNode:
         [m_sum, k] = [m_sum, n] * [num_groups, n, k]
         """
         # concat and transpose w2
+
+        if hasattr(self, "grouped_gemm_experts"):
+            offline_quant = hasattr(
+                self.grouped_gemm_experts.weight2,
+                "fp8_weight_stacked_transpose",
+            ) or hasattr(
+                self.grouped_gemm_experts.weight2, "fp8_weight_stacked"
+            )
+            if not offline_quant:
+                local_expert_num = expert_w2.shape[0]
+                expert_w2 = [
+                    expert_w2[i, :, :] for i in range(local_expert_num)
+                ]
+            else:
+                expert_w2 = [expert_w2]
+
         w2_quant, w2_scale = fused_stack_quant(expert_w2, transpose=True)
         w2_quant = w2_quant.reshape([num_expert, -1, w2_quant.shape[-1]])
         w2_scale = w2_scale.reshape([num_expert, -1, w2_scale.shape[-1]])
@@ -723,13 +755,31 @@ class ExpertsGroupGemmContiguousNode:
         [m_sum, n] = [m_sum, k] * [num_groups, k, n]
         """
         # recompute concated_w2_2d
+
+        if hasattr(self, "grouped_gemm_experts"):
+            offline_quant = hasattr(
+                self.grouped_gemm_experts.weight2,
+                "fp8_weight_stacked_transpose",
+            ) or hasattr(
+                self.grouped_gemm_experts.weight2, "fp8_weight_stacked"
+            )
+            local_expert_num = expert_w2.shape[0]
+            if not offline_quant:
+                expert_w2 = [
+                    expert_w2[i, :, :] for i in range(local_expert_num)
+                ]
+            else:
+                expert_w2 = [expert_w2]
+        else:
+            local_expert_num = len(expert_w2)
+
         # fp8_gemm_nt(do3[m,k], w2[n,k]) = do3 @ w2^T = do3 @ [k,n]
         bw_w2_quant, bw_w2_scale = fused_stack_quant(expert_w2, transpose=False)
         bw_w2_quant = bw_w2_quant.reshape(
-            [len(expert_w2), -1, bw_w2_quant.shape[-1]]
+            [local_expert_num, -1, bw_w2_quant.shape[-1]]
         )
         bw_w2_scale = bw_w2_scale.reshape(
-            [len(expert_w2), -1, bw_w2_scale.shape[-1]]
+            [local_expert_num, -1, bw_w2_scale.shape[-1]]
         )
         if hasattr(
             expert_w2[0], "fp8_weight_stacked_transpose"
@@ -850,12 +900,30 @@ class ExpertsGroupGemmContiguousNode:
         [m_sum, k] = [m_sum, n] * [num_groups, n, k]
         """
         # recompute concated_w1_t
+
+        if hasattr(self, "grouped_gemm_experts"):
+            offline_quant = hasattr(
+                self.grouped_gemm_experts.weight1,
+                "fp8_weight_stacked_transpose",
+            ) or hasattr(
+                self.grouped_gemm_experts.weight1, "fp8_weight_stacked"
+            )
+            local_expert_num = expert_w1.shape[0]
+            if not offline_quant:
+                expert_w1 = [
+                    expert_w1[i, :, :] for i in range(local_expert_num)
+                ]
+            else:
+                expert_w1 = [expert_w1]
+        else:
+            local_expert_num = len(expert_w1)
+
         bw_w1_quant, bw_w1_scale = fused_stack_quant(expert_w1, transpose=False)
         bw_w1_quant = bw_w1_quant.reshape(
-            [len(expert_w1), -1, bw_w1_quant.shape[-1]]
+            [local_expert_num, -1, bw_w1_quant.shape[-1]]
         )
         bw_w1_scale = bw_w1_scale.reshape(
-            [len(expert_w1), -1, bw_w1_scale.shape[-1]]
+            [local_expert_num, -1, bw_w1_scale.shape[-1]]
         )
 
         # quant do1
@@ -1050,7 +1118,9 @@ class ExpertsGroupGemmContiguousNode:
             o3 = paddle.zeros(shape, dtype=dtype)
             return o3
         # get w1/w2
-        if self.moe_grouped_gemm and not self.use_fp8_mlp:
+        if self.moe_grouped_gemm and (
+            not self.use_fp8_mlp or self.moe_deep_gemm
+        ):
             expert_w1 = self.grouped_gemm_experts.weight1
             expert_w2 = self.grouped_gemm_experts.weight2
         else:
@@ -1113,7 +1183,10 @@ class ExpertsGroupGemmContiguousNode:
             dx = paddle.zeros_like(out_grad)
             probs_grad = paddle.zeros_like(unzipped_probs)
 
-            if not self.moe_grouped_gemm or self.use_fp8_mlp:
+            if not (
+                self.moe_grouped_gemm
+                and (not self.use_fp8_mlp or self.moe_deep_gemm)
+            ):
                 for expert in self.experts:
                     if expert is None:
                         continue
@@ -1181,6 +1254,9 @@ class ExpertsGroupGemmContiguousNode:
 
         subbatch_rows = self.moe_subbatch_token_num_after_dispatch
         if subbatch_rows is None:
+            self.tokens_per_expert_tensor = paddle.to_tensor(
+                self.tokens_per_expert, dtype="int64"
+            )
             return self.backward_impl(
                 out_grad, unzipped_probs, a2a_async_fn=a2a_async_fn
             )
@@ -1193,6 +1269,9 @@ class ExpertsGroupGemmContiguousNode:
         rows, _ = out_grad.shape
         nparts = (rows + subbatch_rows - 1) // subbatch_rows
         if nparts <= 1:
+            self.tokens_per_expert_tensor = paddle.to_tensor(
+                self.tokens_per_expert, dtype="int64"
+            )
             return self.backward_impl(
                 out_grad, unzipped_probs, a2a_async_fn=a2a_async_fn
             )
@@ -1217,6 +1296,9 @@ class ExpertsGroupGemmContiguousNode:
             if o1 is not None:
                 self.o1 = o1._slice(s_idx, e_idx)
             self.tokens_per_expert = [e_idx - s_idx]
+            self.tokens_per_expert_tensor = paddle.to_tensor(
+                self.tokens_per_expert, dtype="int64"
+            )
             if self.moe_deep_gemm:
                 self.tokens_per_expert_indices = paddle.repeat_interleave(
                     paddle.arange(len(self.tokens_per_expert)),
@@ -1412,15 +1494,23 @@ class ExpertsGroupGemmContiguousNode:
         """
         backward_impl
         """
-        # recompute expert_w2 and expert_w1
-        expert_w2 = [x.down_proj.weight for x in self.experts if x is not None]
-        expert_w1 = [
-            x.up_gate_proj.weight for x in self.experts if x is not None
-        ]
+        if hasattr(self, "grouped_gemm_experts"):
+            expert_w1 = self.grouped_gemm_experts.weight1
+            expert_w2 = self.grouped_gemm_experts.weight2
+            num_expert = expert_w1.shape[0]
+        else:
+            # recompute expert_w2 and expert_w1
+            expert_w2 = [
+                x.down_proj.weight for x in self.experts if x is not None
+            ]
+            expert_w1 = [
+                x.up_gate_proj.weight for x in self.experts if x is not None
+            ]
+            num_expert = len(expert_w1)
 
         if self.recompute_moe_gate_up:
             o1 = self.fwd_gate_up(
-                None, expert_w1, len(expert_w1), self.tokens_per_expert
+                None, expert_w1, num_expert, self.tokens_per_expert
             )
         else:
             o1 = self.o1
@@ -1510,7 +1600,9 @@ class ExpertsGroupGemmContiguousNode:
             else:
                 x = self.input
 
-        if self.moe_grouped_gemm and not self.use_fp8_mlp:
+        if self.moe_grouped_gemm and (
+            not self.use_fp8_mlp or self.moe_deep_gemm
+        ):
             if hasattr(weights, "main_grad"):
                 if weights.main_grad is None:
                     weights.main_grad = paddle.zeros(
@@ -1522,9 +1614,7 @@ class ExpertsGroupGemmContiguousNode:
                         b=dy,
                         d=weights.main_grad,
                         ks=self.tokens_per_expert,
-                        ks_tensor=paddle.to_tensor(
-                            self.tokens_per_expert, dtype="int32"
-                        ),
+                        ks_tensor=self.tokens_per_expert_tensor,
                         c=weights.main_grad,
                     )
                 else:
@@ -1548,9 +1638,7 @@ class ExpertsGroupGemmContiguousNode:
                         b=dy,
                         d=weights.grad,
                         ks=self.tokens_per_expert,
-                        ks_tensor=paddle.to_tensor(
-                            self.tokens_per_expert, dtype="int32"
-                        ),
+                        ks_tensor=self.tokens_per_expert_tensor,
                         c=weights.grad,
                     )
                 else:
