@@ -44,7 +44,6 @@ classifiers = [
     "Typing :: Typed",
 ]
 
-
 [project.urls]
 Download = "https://github.com/PaddlePaddle/PaddleFleet/releases"
 Homepage = "https://github.com/PaddlePaddle/PaddleFleet/src"

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -177,6 +178,7 @@ def check_submodule_updated():
         if not (
             (ROOT_DIR / "third_party" / "DeepGEMM" / ".git").exists()
             and (ROOT_DIR / "third_party" / "DeepEP" / ".git").exists()
+            and (ROOT_DIR / "third_party" / "HybridEP" / ".git").exists()
             and (ROOT_DIR / "third_party" / "quack" / ".git").exists()
             and (ROOT_DIR / "third_party" / "sonic-moe" / ".git").exists()
             and (ROOT_DIR / "third_party" / "flash-attention" / ".git").exists()
@@ -274,6 +276,9 @@ def get_special_build_deps():
             "paddlepaddle_gpu==3.4.0.post20260429+f2d27632b14",
         ]
         # for deep_ep build
+        if platform.machine() == "aarch64":
+            deps.append("nvidia-nvshmem-cu13>=3.3.9,<3.5")
+            return deps
         if cuda_major == 12:
             if cuda_minor > 6:
                 deps.append("paddle-nvidia-nvshmem-cu12>=3.3.9,<3.5")
@@ -343,6 +348,18 @@ def get_libs():
                 Artifact("deep_ep_cpp.so", "deep_ep_cpp.so"),
             ],
             extra_env={"PADDLE_CUDA_ARCH_LIST": _deep_ep_arch},
+        ),
+        EcosystemLibrary(
+            name="HybridEP",
+            source_rel_path="third_party/HybridEP",
+            artifacts=[
+                Artifact("deep_ep", "hybrid_ep"),
+                Artifact("hybrid_ep_cpp.so", "hybrid_ep_cpp.so"),
+            ],
+            extra_env={
+                "HYBRID_EP_MULTINODE": "1",
+                "PADDLE_CUDA_ARCH_LIST": _deep_ep_arch,
+            },
         ),
         EcosystemLibrary(
             name="flash-attention",

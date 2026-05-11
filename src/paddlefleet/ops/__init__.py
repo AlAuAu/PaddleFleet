@@ -24,6 +24,7 @@ from paddlefleet_ops.ops import (  # noqa: F401
     is_deep_ep_available,
     is_deep_gemm_available,
     is_flash_mask_available,
+    is_hybrid_ep_available,
     is_sonic_moe_available,
 )
 

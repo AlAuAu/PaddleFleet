@@ -40,7 +40,7 @@ _workspace_root = _pkg_root.parent.parent.resolve()
 
 
 def is_git_repo():
-    return (_workspace_root / ".git").is_dir()
+    return (_workspace_root / ".git").exists()
 
 
 def get_git_commit_hash(cwd: Path | None) -> str:

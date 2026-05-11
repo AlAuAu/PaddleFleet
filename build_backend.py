@@ -38,7 +38,7 @@ _pkg_root = Path(__file__).parent.resolve()
 
 
 def is_git_repo() -> bool:
-    return (_pkg_root / ".git").is_dir()
+    return (_pkg_root / ".git").exists()
 
 
 def get_git_commit_hash(cwd: Path) -> str:
