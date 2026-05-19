@@ -358,8 +358,15 @@ class MoELayer(nn.Layer):
                     self.moe_group,
                     self.moe_ep_barrier,
                     dispatcher_type=self.moe_token_dispatcher_type,
+                    hybridep_buffer_configs=getattr(
+                        config, "hybridep_buffer_configs", None
+                    ),
                 )
-                if getattr(config, "deepep_buffer_configs", None) is not None:
+                if (
+                    self.moe_token_dispatcher_type == "deepep"
+                    and getattr(config, "deepep_buffer_configs", None)
+                    is not None
+                ):
                     configure_buffer(**config.deepep_buffer_configs)
             elif self.moe_token_dispatcher_type == "alltoall":
                 local_expert_indices = list(
