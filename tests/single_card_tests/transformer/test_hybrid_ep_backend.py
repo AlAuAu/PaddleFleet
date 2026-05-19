@@ -886,7 +886,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
         counts, num_tokens = _hybrid_ep_prepare_expert_counts(
             custom_map,
             use_fp8_mlp=False,
-            moe_grouped_gemm=False,
+            moe_expert_fusion=False,
         )
 
         self.assertEqual(counts, [2, 0, 1])
@@ -898,7 +898,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
         counts, num_tokens = _hybrid_ep_prepare_expert_counts(
             custom_map,
             use_fp8_mlp=True,
-            moe_grouped_gemm=True,
+            moe_expert_fusion=True,
         )
 
         self.assertIsInstance(counts, paddle.Tensor)
@@ -918,7 +918,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
             _hybrid_ep_prepare_expert_counts(
                 custom_map,
                 use_fp8_mlp=False,
-                moe_grouped_gemm=False,
+                moe_expert_fusion=False,
             )
 
     def test_padding_helpers_restore_forward_shapes(self):
@@ -960,7 +960,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
             custom_map,
             use_fp8_mlp=False,
             moe_deep_gemm=False,
-            moe_grouped_gemm=False,
+            moe_expert_fusion=False,
             is_first_fwd=True,
         )
         output.sum().backward()
@@ -989,7 +989,7 @@ class TestHybridEPExpertInputCounts(unittest.TestCase):
             custom_map,
             use_fp8_mlp=True,
             moe_deep_gemm=False,
-            moe_grouped_gemm=False,
+            moe_expert_fusion=False,
             fp8_dispatched_handle={
                 "scale": paddle.ones([2, 1], dtype="float32")
             },
