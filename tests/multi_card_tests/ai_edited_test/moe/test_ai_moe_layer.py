@@ -128,6 +128,7 @@ class TestMoELayerForward(unittest.TestCase):
             bf16=False,
             params_dtype=paddle.float32,
             moe_intermediate_size=24,
+            moe_deep_gemm=False,
             gated_linear_unit=True,
             n_shared_experts=0,
         )
@@ -182,6 +183,7 @@ class TestMoEGateRouter(unittest.TestCase):
             bf16=False,
             params_dtype=paddle.float32,
             moe_intermediate_size=24,
+            moe_deep_gemm=False,
             gated_linear_unit=True,
             n_shared_experts=0,
         )
@@ -240,7 +242,7 @@ class TestMoEConfigVariants(unittest.TestCase):
     def setUpClass(cls):
         cls.hidden_size = 16
 
-    def _build_moe(self, n_experts, n_shared, grouped_gemm=False):
+    def _build_moe(self, n_experts, n_shared, moe_expert_fusion=False):
         config = TransformerConfig(
             hidden_size=self.hidden_size,
             num_attention_heads=4,
@@ -253,6 +255,7 @@ class TestMoEConfigVariants(unittest.TestCase):
             bf16=False,
             params_dtype=paddle.float32,
             moe_intermediate_size=24,
+            moe_deep_gemm=False,
             gated_linear_unit=True,
             n_shared_experts=n_shared,
         )
@@ -261,7 +264,7 @@ class TestMoEConfigVariants(unittest.TestCase):
         layer_spec = get_gpt_layer_local_spec(
             config,
             num_experts=n_experts,
-            moe_expert_fusion=grouped_gemm,
+            moe_expert_fusion=moe_expert_fusion,
         )
         moe_layer = paddlefleet.transformer.moe.moe_layer.MoELayer(
             config,
