@@ -13,8 +13,11 @@
 // limitations under the License.
 
 #include <cuda_bf16.h>
+#include <cstdint>
+#include <limits>
 #include <vector>
 #include "paddle/extension.h"
+#include "utils.h"  // NOLINT
 
 // ==========================================================================
 // Utils: Packed Memory Access (128-bit Vectorization)
@@ -24,26 +27,7 @@ struct __align__(16) Packed128 {
   int4 data;
 };
 
-// Single source of truth for the kernel block size. Used to size shared
-// memory inside the bwd kernels and to launch all three kernels on the
-// host side. Changing this value automatically keeps the array, the
-// reduction loop, and the launch configuration in sync.
 constexpr int kSwiGLUBlockSize = 256;
-
-// Cap on gridDim.x for the host launch. The kernels use a grid-stride loop
-// over rows, so any int64 rows count is supported without restricting the
-// host-side grid_size to fit in int. 65535 is the legacy hardware-min limit
-// for gridDim.y/z and is far below the 2^31-1 limit for gridDim.x on every
-// supported arch; it is more than enough to saturate any current GPU when
-// each block already covers a full row's hidden dim.
-constexpr int kMaxSwiGLUGridSize = 65535;
-
-template <typename T>
-static inline int ComputeSwiGLUGridSize(T rows) {
-  int64_t r = static_cast<int64_t>(rows);
-  return static_cast<int>(
-      r < static_cast<int64_t>(kMaxSwiGLUGridSize) ? r : kMaxSwiGLUGridSize);
-}
 
 // ------------------------------------------------------------------
 // Sigmoid implementation
@@ -80,7 +64,7 @@ __global__ void VectorizedFusedSwiGLUFwd(const T* __restrict__ x,
     float s = static_cast<float>(scale[row]);
 
     for (int64_t col = lane_idx; col < hidden_size;
-         col += blockDim.x * VEC_SIZE) {
+         col += static_cast<int64_t>(blockDim.x) * VEC_SIZE) {
       int64_t gate_offset = row * row_stride + col;
       int64_t val_offset = gate_offset + hidden_size;
       int64_t out_offset = row * hidden_size + col;
@@ -144,7 +128,7 @@ __global__ void VectorizedFusedSwiGLUBwd(const T* __restrict__ x,
     float s = static_cast<float>(scale[row]);
 
     for (int64_t col = lane_idx; col < hidden_size;
-         col += blockDim.x * VEC_SIZE) {
+         col += static_cast<int64_t>(blockDim.x) * VEC_SIZE) {
       int64_t gate_offset = row * row_stride + col;
       int64_t val_offset = gate_offset + hidden_size;
       int64_t out_offset = row * hidden_size + col;
@@ -261,7 +245,7 @@ __global__ void VectorizedFusedSwiGLUWeightedBwd(
     float p = static_cast<float>(probs[row]);
 
     for (int64_t col = lane_idx; col < hidden_size;
-         col += blockDim.x * VEC_SIZE) {
+         col += static_cast<int64_t>(blockDim.x) * VEC_SIZE) {
       int64_t gate_offset = row * row_stride + col;
       int64_t val_offset = gate_offset + hidden_size;
       int64_t out_offset = row * hidden_size + col;
@@ -370,7 +354,7 @@ static std::vector<paddle::Tensor> FusedSwiGLUScaleForwardImpl(
   // Paddle extension gridDim is int. The kernel uses a grid-stride loop
   // over rows, so we cap grid_size at kMaxSwiGLUGridSize and let the kernel
   // chunk arbitrary int64 rows on device.
-  int grid_size = ComputeSwiGLUGridSize(rows);
+  int grid_size = GetSwiGLURowGridSize(rows);
   int block_size = kSwiGLUBlockSize;
   auto stream = x.stream();
 
@@ -430,7 +414,7 @@ static std::vector<paddle::Tensor> FusedSwiGLUScaleBackwardImpl(
   // Paddle extension gridDim is int. The kernel uses a grid-stride loop
   // over rows, so we cap grid_size at kMaxSwiGLUGridSize and let the kernel
   // chunk arbitrary int64 rows on device.
-  int grid_size = ComputeSwiGLUGridSize(rows);
+  int grid_size = GetSwiGLURowGridSize(rows);
   int block_size = kSwiGLUBlockSize;
   auto stream = x.stream();
 
@@ -500,7 +484,7 @@ static std::vector<paddle::Tensor> FusedSwiGLUWeightedBackwardImpl(
   // Paddle extension gridDim is int. The kernel uses a grid-stride loop
   // over rows, so we cap grid_size at kMaxSwiGLUGridSize and let the kernel
   // chunk arbitrary int64 rows on device.
-  int grid_size = ComputeSwiGLUGridSize(rows);
+  int grid_size = GetSwiGLURowGridSize(rows);
   int block_size = kSwiGLUBlockSize;
   auto stream = x.stream();
 
