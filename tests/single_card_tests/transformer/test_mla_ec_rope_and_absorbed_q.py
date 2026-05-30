@@ -86,6 +86,7 @@ def _make_mla_gpt_config(**overrides):
         "tensor_model_parallel_size": 1,
         "pipeline_model_parallel_size": 1,
         "virtual_pipeline_model_parallel_size": None,
+        "params_dtype": paddle.bfloat16,
         "sequence_parallel": False,
         # FP8
         "fp8": None,
@@ -311,7 +312,8 @@ class TestECRopeBranchFullGPT(unittest.TestCase):
 
         # Compute loss and backward
         loss = paddle.nn.functional.cross_entropy(
-            hidden_states.reshape([-1, config.vocab_size]), labels.reshape([-1])
+            hidden_states.reshape([-1, config.vocab_size]).cast("float32"),
+            labels.reshape([-1]),
         )
         loss_value = loss.item()
         loss.backward()
@@ -395,7 +397,8 @@ class TestECRopeBranchFullGPT(unittest.TestCase):
             hidden_states = result
 
         loss = paddle.nn.functional.cross_entropy(
-            hidden_states.reshape([-1, config.vocab_size]), labels.reshape([-1])
+            hidden_states.reshape([-1, config.vocab_size]).cast("float32"),
+            labels.reshape([-1]),
         )
         loss.backward()
 
@@ -500,7 +503,8 @@ class TestComputeAbsorbedQBranchFullGPT(unittest.TestCase):
 
         # Compute loss and backward
         loss = paddle.nn.functional.cross_entropy(
-            hidden_states.reshape([-1, config.vocab_size]), labels.reshape([-1])
+            hidden_states.reshape([-1, config.vocab_size]).cast("float32"),
+            labels.reshape([-1]),
         )
         loss_value = loss.item()
         loss.backward()
@@ -587,7 +591,8 @@ class TestComputeAbsorbedQBranchFullGPT(unittest.TestCase):
             hidden_states = result
 
         loss = paddle.nn.functional.cross_entropy(
-            hidden_states.reshape([-1, config.vocab_size]), labels.reshape([-1])
+            hidden_states.reshape([-1, config.vocab_size]).cast("float32"),
+            labels.reshape([-1]),
         )
         loss.backward()
 
@@ -698,7 +703,8 @@ class TestCombinedECRopeAndAbsorbedQFullGPT(unittest.TestCase):
 
         # Compute loss and backward
         loss = paddle.nn.functional.cross_entropy(
-            hidden_states.reshape([-1, config.vocab_size]), labels.reshape([-1])
+            hidden_states.reshape([-1, config.vocab_size]).cast("float32"),
+            labels.reshape([-1]),
         )
         loss_value = loss.item()
         loss.backward()
@@ -789,7 +795,8 @@ class TestCombinedECRopeAndAbsorbedQFullGPT(unittest.TestCase):
             hidden_states = result
 
         loss = paddle.nn.functional.cross_entropy(
-            hidden_states.reshape([-1, config.vocab_size]), labels.reshape([-1])
+            hidden_states.reshape([-1, config.vocab_size]).cast("float32"),
+            labels.reshape([-1]),
         )
         loss.backward()
 
@@ -888,7 +895,8 @@ class TestNonExperimentalVersionPositionIds(unittest.TestCase):
             hidden_states = result
 
         loss = paddle.nn.functional.cross_entropy(
-            hidden_states.reshape([-1, config.vocab_size]), labels.reshape([-1])
+            hidden_states.reshape([-1, config.vocab_size]).cast("float32"),
+            labels.reshape([-1]),
         )
         loss.backward()
 
