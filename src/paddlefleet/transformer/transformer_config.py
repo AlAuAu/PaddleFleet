@@ -757,8 +757,28 @@ class TransformerConfig(ModelParallelConfig):
     Useful for debugging or ablation studies.
     """
 
-    csa_sparse_attn_fusion: bool = False
-    """If True, use fused sparse attention tilelang-kernel for CSA.
+    csa_tilelang_backend: str | None = None
+    """Optional CSA TileLang backend.
+
+    None keeps the default Paddle implementation. 'attention_paddle_compat'
+    enables the TileLang indexer and sparse attention paths by default while
+    preserving Paddle-compatible tensor layouts and algorithm semantics.
+    """
+
+    csa_tilelang_enable_indexer: bool | None = None
+    """Optional override for the CSA TileLang indexer path.
+
+    None follows csa_tilelang_backend. True requires
+    csa_tilelang_backend='attention_paddle_compat'. False disables only the
+    CSA indexer TileLang path.
+    """
+
+    csa_tilelang_enable_sparse_attn: bool | None = None
+    """Optional override for the CSA TileLang sparse attention path.
+
+    None follows csa_tilelang_backend. True requires
+    csa_tilelang_backend='attention_paddle_compat'. False disables only the
+    final sparse MQA attention TileLang path.
     """
 
     o_groups: int = 8
@@ -794,6 +814,17 @@ class TransformerConfig(ModelParallelConfig):
         "indexer_use_sparse_loss": "dsa_indexer_use_sparse_loss",
         "indexer_rotary_interleaved": "dsa_indexer_rotary_interleaved",
         "indexer_rope_interleave": "dsa_indexer_rotary_interleaved",
+        # CSA / DSv4 Hybrid field mapping
+        "csa_window_size": "csa_window_size",
+        "csa_compress_ratios": "csa_compress_ratios",
+        "csa_compress_rotary_base": "csa_compress_rotary_base",
+        "csa_dense_mode": "csa_dense_mode",
+        "csa_tilelang_backend": "csa_tilelang_backend",
+        "csa_tilelang_enable_indexer": "csa_tilelang_enable_indexer",
+        "csa_tilelang_enable_sparse_attn": "csa_tilelang_enable_sparse_attn",
+        "o_groups": "o_groups",
+        "o_lora_rank": "o_lora_rank",
+        "qk_pos_emb_head_dim": "qk_pos_emb_head_dim",
     }
 
     @classmethod
@@ -1003,6 +1034,28 @@ class TransformerConfig(ModelParallelConfig):
                         f"csa_compress_ratios[{i}]={r} is invalid. "
                         f"Must be one of {valid_ratios}."
                     )
+
+            valid_tilelang_backends = {None, "attention_paddle_compat"}
+            if self.csa_tilelang_backend not in valid_tilelang_backends:
+                raise ValueError(
+                    f"csa_tilelang_backend={self.csa_tilelang_backend!r} is invalid. "
+                    f"Must be one of {valid_tilelang_backends}."
+                )
+            if (
+                self.csa_tilelang_backend is None
+                and self.csa_tilelang_enable_indexer
+            ):
+                raise ValueError(
+                    "csa_tilelang_enable_indexer=True requires csa_tilelang_backend='attention_paddle_compat'."
+                )
+            if (
+                self.csa_tilelang_backend is None
+                and self.csa_tilelang_enable_sparse_attn
+            ):
+                raise ValueError(
+                    "csa_tilelang_enable_sparse_attn=True requires csa_tilelang_backend='attention_paddle_compat'."
+                )
+
         # Hash-based MoE routing consistency checks.
         if self.moe_n_hash_layers > 0:
             if self.actual_vocab_size is None:
