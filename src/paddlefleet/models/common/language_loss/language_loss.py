@@ -37,6 +37,7 @@ from paddlefleet.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from paddlefleet.process_groups_config import ProcessGroupCollection
+from paddlefleet.training.global_vars import get_global_training_logs
 from paddlefleet.transformer.layer import FleetLayer
 from paddlefleet.transformer.transformer_config import TransformerConfig
 
@@ -582,7 +583,7 @@ class LanguageLoss(FleetLayer):
                         ploss = ploss / xishu
                         mtp_loss.append(ploss)
 
-            # Store detached MTP loss tensors into class-level tracker.
+            # Store detached MTP loss tensors into class-level tracker and global_training_logs.
             # Use .detach() instead of .item() to avoid GPU synchronization on every
             # micro-batch. The trainer will call .item() only at logging steps.
             for i, loss_val in enumerate(mtp_loss):
@@ -594,6 +595,11 @@ class LanguageLoss(FleetLayer):
                     f"mtp{i + 1}.final_loss",
                     loss_val,
                 )
+
+            logs = get_global_training_logs()
+            if logs is not None and hasattr(logs, "update"):
+                for i, loss_val in enumerate(mtp_loss):
+                    logs.update(**{f"mtp_{i + 1}_loss": loss_val.detach()})
 
             def add_loss(main_loss, loss):
                 if _use_accuracy_compatible_kernel():
@@ -687,7 +693,7 @@ class MainLanguageLoss(LanguageLoss):
         else:
             lm_loss = self._forward(logits, lm_labels)
 
-        # Store detached MTP loss tensors into class-level tracker.
+        # Store detached MTP loss tensors into class-level tracker and global_training_logs.
         # Use .detach() instead of .item() to avoid GPU synchronization on every
         # micro-batch. The trainer will call .item() only at logging steps.
         for i, loss_val in enumerate(mtp_loss):
@@ -699,6 +705,12 @@ class MainLanguageLoss(LanguageLoss):
                 f"mtp{i + 1}.final_loss",
                 loss_val,
             )
+
+        # Also write to global_training_logs to read
+        logs = get_global_training_logs()
+        if logs is not None and hasattr(logs, "update"):
+            for i, loss_val in enumerate(mtp_loss):
+                logs.update(**{f"mtp_{i + 1}_loss": loss_val.detach()})
 
         def add_loss(main_loss, loss):
             if _use_accuracy_compatible_kernel():
