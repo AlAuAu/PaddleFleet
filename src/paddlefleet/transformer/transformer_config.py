@@ -295,6 +295,27 @@ class TransformerConfig(ModelParallelConfig):
     multimodal_embedding: bool = False
     """Whether to use multimodal embedding."""
 
+    multimax_modules: list[str] | None = None
+    """Submodules to apply learnable SegLU-style modulation to before softmax.
+
+    Mirrors the Megatron ``recompute_modules`` style: a list of submodule
+    names. ``None`` (default) disables the feature globally. Currently
+    supported list entries:
+
+    - ``"lm_head"``: apply SegLU(x, ranges, ts) on the LM-head logits before
+      the language-modeling softmax/cross-entropy. Adds two [4]-shape
+      learnable parameters (multimax_ranges, multimax_ts) to the LM head.
+      These are excluded from weight decay via the "multimax" substring
+      filter in the trainer's no-decay rule.
+    - ``"attention"``: apply on attention scores before softmax. Reserved;
+      not implemented yet (emits a warning if listed).
+
+    YAML/JSON behaviour:
+    - unset key, ``multimax_modules: null``, or empty list ``multimax_modules: []``
+      all map to Python ``None`` (feature disabled).
+    - ``multimax_modules: [lm_head]`` enables the LM-head branch.
+    """
+
     gated_attention: bool = False
     """If True, enables gated attention where a learnable sigmoid gate is applied to the
     attention output before the output projection. The gate is produced alongside the query
@@ -1287,3 +1308,59 @@ class TransformerConfig(ModelParallelConfig):
                 f"head_wise_swa_ratio must be between 0.0 and 1.0, "
                 f"but got {self.head_wise_swa_ratio}."
             )
+
+        # Multimax validation + grep-friendly confirmation banner.
+        # Operators can verify the setting reached the model with:
+        #   grep MULTIMAX <train.log>
+        import warnings as _warnings
+
+        _multimax = getattr(self, "multimax_modules", None)
+        # YAML entry path returns OmegaConf containers (ListConfig), not
+        # builtin list. Normalize to a plain Python list before any
+        # isinstance(_multimax, list) check; otherwise the recommended
+        # `multimax_modules: [lm_head]` form is rejected.
+        try:
+            from omegaconf import (
+                ListConfig as _ListConfig,
+                OmegaConf as _OmegaConf,
+            )
+
+            if isinstance(_multimax, _ListConfig):
+                _multimax = _OmegaConf.to_container(_multimax, resolve=True)
+                self.multimax_modules = _multimax
+        except ImportError:
+            pass
+        # Allow yaml/json to leave the field unset, set to ``null``, pass an
+        # empty string, or pass an empty list -- all map to the canonical
+        # disabled sentinel ``None``.
+        if _multimax in ("", []):
+            _multimax = None
+            self.multimax_modules = None
+        # Back-compat: a plain string is treated as a single-element list
+        # so older configs (multimax_modules: lm_head) keep working.
+        if isinstance(_multimax, str):
+            _multimax = [_multimax]
+            self.multimax_modules = _multimax
+        if _multimax is not None:
+            if not isinstance(_multimax, list) or not all(
+                isinstance(x, str) for x in _multimax
+            ):
+                raise ValueError(
+                    f"multimax_modules must be None or a list[str], "
+                    f"got {_multimax!r}."
+                )
+            _valid = {"lm_head", "attention"}
+            _bad = [x for x in _multimax if x not in _valid]
+            if _bad:
+                raise ValueError(
+                    f"multimax_modules entries must each be one of "
+                    f"{sorted(_valid)}, got invalid entries {_bad!r} "
+                    f"in {_multimax!r}."
+                )
+            if "attention" in _multimax:
+                _warnings.warn(
+                    f"[MULTIMAX-CONFIG] multimax_modules={_multimax}: "
+                    "'attention' branch is not implemented yet; only the "
+                    "lm_head modulation will take effect."
+                )
+            _warnings.warn(f"[MULTIMAX-CONFIG] multimax_modules={_multimax}")
