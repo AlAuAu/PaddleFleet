@@ -48,6 +48,38 @@ if paddlefleet_ops.is_sonic_moe_available():
 logger = logging.getLogger(__name__)
 
 
+def _copy_sonic_fp8_weight_attrs(src, dst):
+    for attr_name in ("fp8", "transposed_fp8"):
+        attr = getattr(src, attr_name, None)
+        if attr is None:
+            raise RuntimeError(
+                f"Sonic FP8 forward requires weight.{attr_name} attribute; "
+                "call quant_weight() before FP8 forward."
+            )
+        setattr(dst, attr_name, attr)
+
+
+class _SonicFP8WeightCarrier(paddle.autograd.PyLayer):
+    @staticmethod
+    def forward(ctx, weight):
+        carrier = paddle.empty([1], dtype=weight.dtype).as_strided(
+            [weight.shape[1], weight.shape[2], weight.shape[0]], [0, 0, 0]
+        )
+        carrier.stop_gradient = weight.stop_gradient
+        _copy_sonic_fp8_weight_attrs(weight, carrier)
+        return carrier
+
+    @staticmethod
+    def backward(ctx, grad):
+        if grad is None:
+            return None
+        return grad.transpose([2, 0, 1])
+
+
+def _make_sonic_fp8_weight_carrier(weight):
+    return _SonicFP8WeightCarrier.apply(weight)
+
+
 class UnZipNode:
     """
     UnZipNode 类用于对输入的token 矩阵根据分发索引进行解压操作,得到专家需要处理的 token。
@@ -2178,16 +2210,27 @@ class HybridEPMoePyLayer(paddle.autograd.PyLayer):
 
 
 def run_sonic_moe(
-    hidden_states, topk_indices, topk_scores, K, E, w1, w2, fp8=False
+    hidden_states,
+    topk_indices,
+    topk_scores,
+    K,
+    E,
+    w1,
+    w2,
+    fp8=False,
+    tokens_per_expert=None,
+    fp8_scale=None,
+    fp8_combine_grad_handle=None,
 ):
     T = hidden_states.shape[0]
     stream_id = paddle.device.current_stream()
 
-    valid = topk_indices >= 0
-    valid_experts = topk_indices[valid].cast(paddle.int32)
-    tokens_per_expert = paddle.bincount(valid_experts, minlength=E).cast(
-        paddle.int32
-    )
+    if tokens_per_expert is None:
+        valid = topk_indices >= 0
+        valid_experts = topk_indices[valid].cast(paddle.int32)
+        tokens_per_expert = paddle.bincount(valid_experts, minlength=E).cast(
+            paddle.int32
+        )
 
     (
         expert_frequency_offset,
@@ -2222,11 +2265,22 @@ def run_sonic_moe(
         score_src_idx=_score_src_idx,
     )
 
+    fp8_hidden_states = None
+    if fp8_scale is not None:
+        fp8_hidden_states = (hidden_states, fp8_scale)
+
+    if fp8:
+        w1_sonic = _make_sonic_fp8_weight_carrier(w1)
+        w2_sonic = _make_sonic_fp8_weight_carrier(w2)
+    else:
+        w1_sonic = w1.permute([1, 2, 0])
+        w2_sonic = w2.permute([1, 2, 0])
+
     with enable_fp8(fp8):
         _refresh_fp8_config()
         y1, z = _UpProjection.apply(
             hidden_states,
-            w1.permute([1, 2, 0]),
+            w1_sonic,
             None,
             expert_frequency_offset,
             total_expert_freq,
@@ -2240,11 +2294,12 @@ def run_sonic_moe(
             activation_type,
             is_inference_mode_enabled=False,
             use_low_precision_postact_buffer=False,
+            prequant_activation_payload=fp8_hidden_states,
         )
         hidden_states = _DownProjection.apply(
             y1,
             z,
-            w2.permute([1, 2, 0]),
+            w2_sonic,
             None,
             scores_for_down,
             s_scatter_idx,
@@ -2259,6 +2314,7 @@ def run_sonic_moe(
             True,  # is_varlen_k
             activation_type,
             None,
+            fp8_combine_grad_handle,
         )
 
     return hidden_states
