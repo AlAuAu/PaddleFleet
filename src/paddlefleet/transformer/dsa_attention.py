@@ -582,6 +582,8 @@ def _compute_dsa_indexer_loss(
     sparse_loss: bool,
     tp_group,
     causal_mask_override: Tensor | None = None,
+    loss_mask: Tensor | None = None,
+    global_valid_count: float | None = None,
 ) -> Tensor:
     """Compute KL divergence loss between index_scores and true attention_scores.
 
@@ -689,7 +691,13 @@ def _compute_dsa_indexer_loss(
     )
 
     # [b, sq, sk] -> [b, sq] -> [1]
-    kl_div = kl_per_element.sum(axis=-1).mean()
+    kl_per_pos = kl_per_element.sum(axis=-1)
+    if loss_mask is not None:
+        # loss_mask: [b, sq] — mask out padding positions
+        lm = loss_mask.reshape(kl_per_pos.shape).astype(kl_per_pos.dtype)
+        kl_div = (kl_per_pos * lm).sum() / global_valid_count
+    else:
+        kl_div = kl_per_pos.mean()
     indexer_loss = kl_div * loss_coeff
 
     return indexer_loss
@@ -959,6 +967,8 @@ class FusedDSAIndexerLoss(paddle.autograd.PyLayer):
         mask: Tensor | None = None,
         sparse_loss: bool = True,
         tp_group=None,
+        loss_mask: Tensor | None = None,
+        global_valid_count: float | None = None,
     ) -> Tensor:
         """Fused forward: compute index_scores, topk, and KL loss.
 
@@ -1022,6 +1032,8 @@ class FusedDSAIndexerLoss(paddle.autograd.PyLayer):
                 sparse_loss,
                 tp_group,
                 causal_mask_override=mask,
+                loss_mask=loss_mask,
+                global_valid_count=global_valid_count,
             )
 
         ctx.save_for_backward(q, weights, k, query, key, topk_indices)
@@ -1185,7 +1197,9 @@ class DSAIndexerLossLoggingHelper:
 
         # DP avg
         dp_group = parallel_state.get_data_parallel_group(
-            check_initialized=False
+            check_initialized=False,
+            with_context_parallel=parallel_state.get_context_parallel_world_size()
+            > 1,
         )
         if dp_group is not None and dp_group.nranks > 1:
             paddle.distributed.all_reduce(values, group=dp_group)
