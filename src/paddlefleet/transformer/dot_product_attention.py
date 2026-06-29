@@ -426,9 +426,12 @@ class DotProductAttention(FleetLayer):
             and attn_mask_startend_row_indices is None
             and not use_eager
         ):
-            assert self.is_swa is False, (
-                "SWA doesn't support scaled_dot_product_attention"
-            )
+            if self.training or query.shape[1] > 1:
+                assert self.is_swa is False, (
+                    "SWA prefill (q_len > 1) must not use SDPA — pass "
+                    "attn_mask_startend_row_indices to route through flashmask."
+                )
+
             # KV cache support for inference
             if use_cache and past_key_values is not None:
                 key, value = past_key_values.update(key, value, layer_idx)
@@ -468,7 +471,16 @@ class DotProductAttention(FleetLayer):
         ):
             # Note:
             # attn_mask_startend_row_indices is not None for flashmask
-            is_causal = attn_mask_type == AttnMaskType.causal
+            # KV cache support for inference with flashmask
+            if use_cache and past_key_values is not None:
+                key, value = past_key_values.update(key, value, layer_idx)
+                # During decode (q_len==1), disable causal since single query attends to all KV
+                if query.shape[1] == 1:
+                    is_causal = False
+                else:
+                    is_causal = True
+            else:
+                is_causal = attn_mask_type == AttnMaskType.causal
             if self.context_parallel_size > 1:
                 flashmask_attention_func = (
                     self.rr_flashmask_attention_cp_func
