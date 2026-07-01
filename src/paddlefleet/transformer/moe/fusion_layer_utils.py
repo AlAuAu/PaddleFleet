@@ -317,6 +317,7 @@ class MlpNode:
         use_ue8m0=False,
         dw_p2p_overlap=False,
         clamp_value=None,
+        use_accuracy_compatible=False,
     ):
         """
         Constructor
@@ -402,6 +403,7 @@ class MlpNode:
                     dw_p2p_overlap=dw_p2p_overlap,
                     moe_expert_fusion=moe_expert_fusion,
                     clamp_value=clamp_value,
+                    use_accuracy_compatible=use_accuracy_compatible,
                 )
                 for local_expert_id in range(self.num_experts_per_device)
             ]
@@ -418,6 +420,7 @@ class MlpNode:
                 dw_p2p_overlap=dw_p2p_overlap,
                 moe_expert_fusion=moe_expert_fusion,
                 clamp_value=clamp_value,
+                use_accuracy_compatible=use_accuracy_compatible,
             )
         self.unzip_node = UnZipNode(self.token_dispatcher)
         self.zip_node = ZipNode(self.token_dispatcher)
@@ -2027,6 +2030,7 @@ class FusionMoePyLayer(paddle.autograd.PyLayer):
         use_ue8m0=False,
         dw_p2p_overlap=False,
         clamp_value=None,
+        use_accuracy_compatible=False,
     ):
         """
         根据给定的参数执行前向传播操作。
@@ -2056,6 +2060,7 @@ class FusionMoePyLayer(paddle.autograd.PyLayer):
             use_ue8m0=use_ue8m0,
             dw_p2p_overlap=dw_p2p_overlap,
             clamp_value=clamp_value,
+            use_accuracy_compatible=use_accuracy_compatible,
         )
 
         if fp8_dispatched_handle is not None:
@@ -2185,6 +2190,7 @@ class HybridEPMoePyLayer(paddle.autograd.PyLayer):
         is_first_fwd=False,
         dw_p2p_overlap=False,
         clamp_value=None,
+        use_accuracy_compatible=False,
     ):
         node = ExpertsGroupGemmContiguousNode(
             custom_map,
@@ -2196,6 +2202,7 @@ class HybridEPMoePyLayer(paddle.autograd.PyLayer):
             moe_expert_fusion=moe_expert_fusion,
             dw_p2p_overlap=dw_p2p_overlap,
             clamp_value=clamp_value,
+            use_accuracy_compatible=use_accuracy_compatible,
         )
         original_hidden_shape = tuple(hidden_states.shape)
         original_probs_shape = tuple(dispatched_probs.shape)
