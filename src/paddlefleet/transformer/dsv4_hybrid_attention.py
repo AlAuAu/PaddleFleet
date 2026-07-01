@@ -53,9 +53,15 @@ if TYPE_CHECKING:
     from paddlefleet.transformer.transformer_config import TransformerConfig
 
 
-def _q_rms_norm(q: Tensor, eps: float) -> Tensor:
+def _q_rms_norm(q: Tensor, eps: float, high_precision_norm: bool) -> Tensor:
     """RMS normalization for query (no learnable weight)."""
-    return q * paddle.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+    if high_precision_norm:
+        ori_dtype = q.dtype
+        q = q.float()
+        q = q * paddle.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+        return q.astype(ori_dtype)
+    else:
+        return q * paddle.rsqrt(q.square().mean(-1, keepdim=True) + eps)
 
 
 from paddlefleet.transformer.utils import (
@@ -387,7 +393,10 @@ class DSv4HybridAttention(Attention):
             # DSv4 reference uses pure norm-preserving RoPE; YaRN's mscale is not applied.
             mscale = 1.0
 
-            if self.config.apply_rope_fusion:
+            if (
+                self.config.apply_rope_fusion
+                and not self.config.high_precision_rope
+            ):
                 from paddlefleet.triton_ops import fused_apply_mla_rope_inplace
 
                 # The clone is necessary because sparse attention depends on core_attn_out
@@ -412,6 +421,7 @@ class DSv4HybridAttention(Attention):
                     multi_latent_attention=True,
                     inverse=True,
                     mla_output_remove_interleaving=True,
+                    high_precision_rope=self.config.high_precision_rope,
                 )
                 core_attn_out = paddle.concat([content_part, rot_part], axis=-1)
                 core_attn_out = core_attn_out.reshape([b, sq, -1])
@@ -572,11 +582,23 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
         q, _ = self.linear_q_up_proj(q_compressed)  # [b, sq, n * v_head_dim]
         q = q.reshape([b, sq, self.num_attention_heads, self.v_head_dim])
-        q = _q_rms_norm(q, getattr(self.config, "rms_norm_eps", 1e-5))
+        q = _q_rms_norm(
+            q,
+            getattr(self.config, "rms_norm_eps", 1e-5),
+            high_precision_norm=self.config.swa_high_precision_norm,
+        )
 
         # KV path
         kv, _ = self.linear_kv_proj(hidden_states)  # [b, sq, v_head_dim]
-        kv = self.kv_layernorm(kv)
+
+        if self.config.swa_high_precision_norm:
+            kv = self.kv_layernorm(
+                kv,
+                high_precision_norm=True,
+                return_high_precision_norm=True,
+            )
+        else:
+            kv = self.kv_layernorm(kv)
 
         # Apply RoPE to both Q and KV
         pos_dim = self.qk_pos_emb_head_dim
@@ -594,7 +616,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             mscale = 1.0
 
             # Q RoPE: split nope/pe, apply RoPE to pe part
-            if self.config.apply_rope_fusion:
+            if (
+                self.config.apply_rope_fusion
+                and not self.config.high_precision_rope
+            ):
                 from paddlefleet.triton_ops import fused_apply_mla_rope_inplace
 
                 query = fused_apply_mla_rope_inplace(q, freqs, nope_dim, mscale)
@@ -608,6 +633,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     rotary_interleaved=False,
                     multi_latent_attention=True,
                     mla_output_remove_interleaving=True,
+                    high_precision_rope=self.config.high_precision_rope,
                 )
                 query = paddle.concat([q_nope, q_pe], axis=-1)
 
@@ -623,6 +649,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 rotary_interleaved=False,
                 multi_latent_attention=True,
                 mla_output_remove_interleaving=True,
+                high_precision_rope=self.config.high_precision_rope,
             )
             kv_pe = kv_pe.squeeze(2)
 
@@ -630,10 +657,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             #   kv_nope: bf16 -> fp32 -> fp8e4m3 ->fp32 -> bf16
             if self.use_fp8_qat:
                 kv_nope = fp8_simulate_qat(kv_nope, 64)
-
             kv = paddle.concat([kv_nope, kv_pe], axis=-1)
         else:
             query = q
+
+        if self.config.swa_high_precision_norm:
+            kv = kv.astype(hidden_states.dtype)
 
         # Single head: key = value = [b, sq, 1, v_head_dim]
         key = kv.unsqueeze(2)
