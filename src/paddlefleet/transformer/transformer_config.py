@@ -454,6 +454,11 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'deepep'.
     Options are 'allgather', 'alltoall', 'deepep', and 'hybridep'."""
 
+    moe_allgather_gate_overlap: bool = False
+    """Whether to issue the AllGather before the gate so it overlaps with gate
+    compute. Only honoured when ``moe_token_dispatcher_type='allgather'`` and
+    ``expert_model_parallel_size > 1``; ignored otherwise."""
+
     moe_use_fusion_node: bool = True
     """Whether to use fusion node for MoE layer. Default is True"""
 

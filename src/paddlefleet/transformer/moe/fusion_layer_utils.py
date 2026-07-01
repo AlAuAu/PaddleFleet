@@ -2273,6 +2273,15 @@ def run_sonic_moe(
             paddle.int32
         )
 
+    # paddle.cast is not a no-op for matching dtype (it allocates + copies),
+    # so cast once with a guard instead of twice below. Allgather feeds int32
+    # (zero copies); deepep feeds int64 (one copy instead of two).
+    topk_indices_i32 = (
+        topk_indices
+        if topk_indices.dtype == paddle.int32
+        else topk_indices.cast(paddle.int32)
+    )
+
     (
         expert_frequency_offset,
         x_gather_idx,
@@ -2285,7 +2294,7 @@ def run_sonic_moe(
         _N_recv,
         _score_src_idx,
     ) = deepep_topk_to_sonic_metadata(
-        topk_indices.cast(paddle.int32),
+        topk_indices_i32,
         topk_scores,
         tokens_per_expert,
         E,
@@ -2298,7 +2307,7 @@ def run_sonic_moe(
     total_expert_freq = TK_padded
     scores_for_down = _differentiable_router_scores(
         topk_scores,
-        topk_indices.cast(paddle.int32),
+        topk_indices_i32,
         num_activated_expert_per_token_offset,
         TK_padded - total_pad_rows,
         TK_padded,
