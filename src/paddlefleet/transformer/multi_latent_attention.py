@@ -851,6 +851,68 @@ class MLASelfAttention(MultiLatentAttention):
                 # mscale is already accounted for in self.softmax_scale; set to 1.0 to avoid double-applying
                 # mscale = 1.0
 
+        cp_size = get_context_parallel_world_size()
+        if cp_size > 1:
+            # Keep RoPE inputs local to the current CP rank before the fused
+            # and non-fused apply paths consume them.
+            if packed_seq_params is not None:
+                raise ValueError(
+                    "Context parallel RoPE scatter in MLA does not support "
+                    "packed_seq_params yet."
+                )
+            if self.config.sequence_parallel:
+                local_seq_len = (
+                    hidden_states.shape[0]
+                    * self.config.tensor_model_parallel_size
+                )
+            else:
+                local_seq_len = hidden_states.shape[1]
+            expected_rotary_seq_len = cp_size * local_seq_len
+            if rotary_seq_len != expected_rotary_seq_len:
+                raise ValueError(
+                    "Context parallel requires rotary_seq_len to be the global "
+                    f"sequence length, got rotary_seq_len={rotary_seq_len}, "
+                    f"expected={expected_rotary_seq_len}, cp_size={cp_size}, "
+                    f"local_seq_len={local_seq_len}, "
+                    f"sequence_parallel={self.config.sequence_parallel}, "
+                    f"tensor_model_parallel_size="
+                    f"{self.config.tensor_model_parallel_size}."
+                )
+            if rotary_pos_cos is not None and rotary_pos_sin is not None:
+                if (
+                    rotary_pos_cos.shape[1] != rotary_seq_len
+                    or rotary_pos_sin.shape[1] != rotary_seq_len
+                ):
+                    raise ValueError(
+                        "Context parallel requires rotary_pos_cos/sin sequence "
+                        f"length to match rotary_seq_len, got "
+                        f"cos={rotary_pos_cos.shape}, "
+                        f"sin={rotary_pos_sin.shape}, "
+                        f"rotary_seq_len={rotary_seq_len}."
+                    )
+                rotary_pos_cos = ContextParallelScatterOp.apply(
+                    rotary_pos_cos, axis=1, mode=self.config.cp_balance_mode
+                ).contiguous()
+                rotary_pos_sin = ContextParallelScatterOp.apply(
+                    rotary_pos_sin, axis=1, mode=self.config.cp_balance_mode
+                ).contiguous()
+            elif rotary_pos_emb is not None:
+                if rotary_pos_emb.shape[1] != rotary_seq_len:
+                    raise ValueError(
+                        "Context parallel requires rotary_pos_emb sequence "
+                        f"length to match rotary_seq_len, got "
+                        f"rotary_pos_emb={rotary_pos_emb.shape}, "
+                        f"rotary_seq_len={rotary_seq_len}."
+                    )
+                rotary_pos_emb = ContextParallelScatterOp.apply(
+                    rotary_pos_emb, axis=1, mode=self.config.cp_balance_mode
+                )
+            else:
+                raise ValueError(
+                    "Context parallel requires rotary_pos_emb or rotary_pos_cos/sin "
+                    "to be prepared before applying MLA RoPE."
+                )
+
         if (
             packed_seq_params is not None
             and packed_seq_params.qkv_format == "thd"
@@ -1035,6 +1097,12 @@ class MLASelfAttention(MultiLatentAttention):
                 else:
                     cos = rotary_pos_cos
                     sin = rotary_pos_sin
+                if cos.shape[1] != q_len or sin.shape[1] != q_len:
+                    raise ValueError(
+                        "Fused MLA RoPE requires local cos/sin sequence "
+                        f"length to match q_len, got cos={cos.shape}, "
+                        f"sin={sin.shape}, q_len={q_len}."
+                    )
                 query = fused_apply_mla_rope_for_q(
                     q,
                     cos,
@@ -1086,13 +1154,7 @@ class MLASelfAttention(MultiLatentAttention):
                     if position_ids.numel() == q_len:
                         start_pos = int(position_ids.flatten()[0].item())
 
-                if get_context_parallel_world_size() > 1:
-                    # In EB dataflow and CP size > 1, rotary_pos_emb is [1, s, 1, d];
-                    # we need to scatter it to [1, s/cp, 1, d] here.
-                    rotary_pos_emb = ContextParallelScatterOp.apply(
-                        rotary_pos_emb, axis=1, mode=self.config.cp_balance_mode
-                    )
-                elif (
+                if get_context_parallel_world_size() == 1 and (
                     packed_seq_params is None
                     or self.config.context_parallel_size == 1
                 ):
@@ -1126,6 +1188,23 @@ class MLASelfAttention(MultiLatentAttention):
                                 if self.training
                                 else position_ids,
                             )
+
+                if packed_seq_params is not None:
+                    raise ValueError(
+                        "MLA qkv_up_proj_and_rope_apply does not support "
+                        "packed_seq_params yet."
+                    )
+                expected_rotary_pos_emb_len = q_len
+                if rotary_pos_emb.shape[1] != expected_rotary_pos_emb_len:
+                    raise ValueError(
+                        "MLA RoPE requires local rotary_pos_emb sequence "
+                        f"length to match expected length, got "
+                        f"rotary_pos_emb={rotary_pos_emb.shape}, "
+                        f"expected={expected_rotary_pos_emb_len}, q_len={q_len}, "
+                        f"sequence_parallel={self.config.sequence_parallel}, "
+                        f"tensor_model_parallel_size="
+                        f"{self.config.tensor_model_parallel_size}."
+                    )
 
                 # Replace paddle.split with zero-copy slice views.
                 q_no_pe = q[..., : self.qk_nope_head_dim]
