@@ -180,6 +180,9 @@ class MoELayer(nn.Layer):
         self.using_sonic_moe = self.config.using_sonic_moe
         self.fp8_dispatch = bool(config.fp8)
         self.fp8_wgrad = config.fp8_wgrad
+        self.fp8_dispatch_bwd = (
+            self.fp8_dispatch and self.using_sonic_moe and self.fp8_wgrad
+        )
         self.moe_expert_fusion = config.moe_expert_fusion
         self.moe_subbatch_token_num_after_dispatch = (
             config.moe_subbatch_token_num_after_dispatch
@@ -749,7 +752,7 @@ class MoELayer(nn.Layer):
             hidden_states,
             combine_overlap_handle,
             use_rr_deepep_combine=self.use_rr_deepep_combine,
-            fp8_dispatch=self.fp8_dispatch and self.using_sonic_moe,
+            fp8_dispatch=self.fp8_dispatch_bwd,
             combine_grad_handle=fp8_combine_grad_handle,
         )
 
@@ -917,9 +920,8 @@ class MoELayer(nn.Layer):
                 self.num_experts_per_tok,
                 tokens_per_expert,
             )
-        fp8_combine_grad_handle = (
-            {} if self.fp8_dispatch and self.using_sonic_moe else None
-        )
+        fp8_combine_grad_handle = {} if self.fp8_dispatch_bwd else None
+        # fp8_combine_grad_handle = None
 
         with profile("fusion_mlp"):
             if self._use_hybrid_ep_fusion():
