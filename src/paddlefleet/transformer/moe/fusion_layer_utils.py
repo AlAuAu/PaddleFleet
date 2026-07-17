@@ -21,7 +21,12 @@ import paddlefleet_ops
 
 from paddlefleet.transformer.moe.fp8_utils import ExpertsGroupGemmContiguousNode
 
-from .fp8_utils import FP8_ALIGN, USE_INPLACE_SWIGLU_BWD, tilewise_quant
+from .fp8_utils import (
+    FP8_ALIGN,
+    USE_INPLACE_SWIGLU_BWD,
+    moe_token_padding_alignment,
+    tilewise_quant,
+)
 from .moe_utils import get_auto_sb_history
 from .vmm_utils import (
     allocator_free_block_info,
@@ -194,6 +199,7 @@ class UnZipNode:
         num_experts,
         tokens_per_expert,
         fill_output=True,
+        padding_alignment=FP8_ALIGN,
     ):
         """
         前向传播函数，用于解压输入的张量。
@@ -230,7 +236,7 @@ class UnZipNode:
                 dispatched_probs,
                 num_experts=num_experts,
                 tokens_per_expert=tokens_per_expert,
-                padding_alignment=FP8_ALIGN,
+                padding_alignment=padding_alignment,
                 do_gather=fill_output,
                 using_ue8m0_scale=using_ue8m0_scale,
             )
@@ -334,6 +340,7 @@ class ZipNode:
         num_experts,
         tokens_per_expert,
         fill_output=True,
+        padding_alignment=FP8_ALIGN,
     ):
         with paddle.amp.auto_cast(False):
             (
@@ -348,7 +355,7 @@ class ZipNode:
                 dispatched_probs,
                 num_experts,
                 tokens_per_expert,
-                padding_alignment=FP8_ALIGN,
+                padding_alignment=padding_alignment,
                 do_gather=fill_output,
             )
         return unzipped_grad
@@ -509,8 +516,21 @@ class MlpNode:
         self.dispatched_indices = None
         self.dispatched_probs = None
         self.unzipped_probs = None
+        # == [MG accuracy-alignment diff · ref PF PR#968] per-expert padding alignment ==
+        # When use_accuracy_compatible=True and non-fp8/non-grouped_gemm, use
+        #   alignment=1 (real token count) so the permute and per-expert GEMM M dim
+        #   equal the real tokens_per_expert and cuBLAS picks the same algorithm as
+        #   MG SequentialMLP; otherwise align to FP8_ALIGN (kernel requirement) to
+        #   preserve the original behavior.
+        self.moe_permute_padding_alignment = moe_token_padding_alignment(
+            use_fp8_mlp=use_fp8_mlp,
+            moe_grouped_gemm=moe_expert_fusion,
+            use_accuracy_compatible=use_accuracy_compatible,
+        )
         self.padding_token_per_experts = [
-            (x + FP8_ALIGN - 1) // FP8_ALIGN * FP8_ALIGN
+            (x + self.moe_permute_padding_alignment - 1)
+            // self.moe_permute_padding_alignment
+            * self.moe_permute_padding_alignment
             for x in self.tokens_per_expert
         ]
         self.token_offsets = [0]
@@ -1182,6 +1202,7 @@ class MlpNode:
         dispatched_indices,
         dispatched_probs,
         fill_output,
+        padding_alignment=None,
     ):
         """
         前向计算的公共预处理，被 forward() 和 forward_auto_subbatch() 共用。
@@ -1261,6 +1282,11 @@ class MlpNode:
             num_experts=num_experts,
             tokens_per_expert=self.tokens_per_expert,
             fill_output=fill_output,
+            **(
+                {}
+                if padding_alignment is None
+                else {"padding_alignment": padding_alignment}
+            ),
         )
         self.unzipped_probs = unzipped_probs
 
@@ -1408,6 +1434,7 @@ class MlpNode:
             dispatched_indices,
             dispatched_probs,
             fill_output=zip_unzip_fusion,
+            padding_alignment=self.moe_permute_padding_alignment,
         )
 
         # 2. subbatch planning
@@ -1995,6 +2022,7 @@ class MlpNode:
             num_experts=len(self.tokens_per_expert),
             tokens_per_expert=self.tokens_per_expert,
             fill_output=zip_unzip_fusion,
+            padding_alignment=self.moe_permute_padding_alignment,
         )
         if self.recompute_moe_premute and zip_unzip_fusion:
             (unzipped_tokens, _, _, unzipped_scale) = self.unzip_node.forward(
@@ -2005,6 +2033,7 @@ class MlpNode:
                 num_experts=len(self.tokens_per_expert),
                 tokens_per_expert=self.tokens_per_expert,
                 fill_output=True,
+                padding_alignment=self.moe_permute_padding_alignment,
             )
 
         # 2. subbatch planning
@@ -2788,6 +2817,7 @@ class MlpNode:
             dispatched_indices,
             dispatched_probs,
             fill_output=fill_output,
+            padding_alignment=self.moe_permute_padding_alignment,
         )
         fwd_path = "unknown"
         if (
@@ -2941,6 +2971,7 @@ class MlpNode:
             num_experts=len(self.tokens_per_expert),
             tokens_per_expert=self.tokens_per_expert,
             fill_output=fill_output,
+            padding_alignment=self.moe_permute_padding_alignment,
         )
         hidden_states_out_grad._record_stream()
         bwd_path = "unknown"
