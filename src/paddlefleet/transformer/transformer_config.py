@@ -668,6 +668,12 @@ class TransformerConfig(ModelParallelConfig):
     use_fp8_qat: bool = False
     """Whether to enable FP8 Quantization-Aware Training (QAT)."""
 
+    full_fp8_computation: bool = False
+    """Master switch for FP8 on Linear / ColumnParallelLinear / RowParallelLinear
+    and DSv4HybridSelfAttention / CSAIndexer. When ``False`` these layers stay
+    in bf16 regardless of ``fp8`` / ``fp8_wgrad`` / ``use_ue8m0``. Pre-existing
+    FP8 paths (e.g. ``moe_layer`` / ``moe_expert``) ignore this flag."""
+
     ####################
     # initialization
     ####################
