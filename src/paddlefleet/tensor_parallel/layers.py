@@ -247,6 +247,9 @@ class VocabParallelEmbedding(paddle.nn.Layer):
             self.vocab_end_index - self.vocab_start_index
         )
         self.deterministic_mode = config.deterministic_mode
+        self.use_accuracy_compatible = getattr(
+            config, "use_accuracy_compatible", False
+        )
         self.config = config
         self.world_size = get_pg_size(self.tp_group)
 
@@ -309,7 +312,7 @@ class VocabParallelEmbedding(paddle.nn.Layer):
         else:
             masked_input = input_
         # Get the embeddings.
-        if self.deterministic_mode:
+        if self.deterministic_mode or self.use_accuracy_compatible:
             output_parallel = self.weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
