@@ -666,7 +666,6 @@ class SonicMoEExpert(GroupedMLPExpert):
             self._weights_layout = self._SONIC_LAYOUT
         elif w1_shape[1] == w2_shape[2] and w1_shape[2] == 2 * w2_shape[1]:
             self._weights_layout = self._GROUPED_LAYOUT
-
         if self._weights_layout == target_layout:
             return
         with paddle.no_grad():

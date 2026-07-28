@@ -336,7 +336,13 @@ class GPTModel(PipelineLayer):
             self.add_sequential_layer(
                 layers,
                 SharedLayerDesc(
-                    "embed",
+                    # Distinct key from the main head's "embed": when VPP segmentation
+                    # co-locates the MTP head and the main head on the same pp stage+chunk,
+                    # a shared "embed" key makes pp_layers._build_layer_impl dedup them to
+                    # ONE instance (the MTP head), so GPTMainLMHead is never built/run and
+                    # MainLanguageLoss hits KeyError: 'logits'. A separate key keeps both
+                    # heads as distinct instances.
+                    "mtp_lm_head",
                     spec.mtp_lm_head,
                     shared_weight_attr="embedding_weight",
                 ),
