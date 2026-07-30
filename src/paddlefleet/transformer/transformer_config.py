@@ -410,6 +410,11 @@ class TransformerConfig(ModelParallelConfig):
     sigmoid_gate_fusion: bool = False
     """If True, use Triton fused sigmoid gate kernel."""
 
+    dsv4_yarn_rope_fusion: bool = False
+    """If True, use the Triton fused kernel to build the YaRN RoPE frequency table
+    in the DSV4 hybrid attention path. Only the DSV4 hybrid attention path reads this
+    field; the standard MLA / DSA YaRN paths ignore it."""
+
     ####################
     # activation recomputation
     ####################

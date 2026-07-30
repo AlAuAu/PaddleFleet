@@ -369,6 +369,9 @@ class DSv4HybridAttention(Attention):
                 beta_slow=getattr(config, "beta_slow", 1),
                 mscale=getattr(config, "mscale", 1.0),
                 mscale_all_dim=getattr(config, "mscale_all_dim", 0.0),
+                yarn_rope_fusion=getattr(
+                    config, "dsv4_yarn_rope_fusion", False
+                ),
             )
 
         self.core_attention = build_spec_layer(
@@ -597,9 +600,9 @@ class DSv4HybridAttention(Attention):
         wo_a_weight = self.linear_o_group_proj.reshape(
             [self.o_local_groups, self.config.o_lora_rank, -1]
         )
-        core_attn_out = paddle.einsum(
-            "...gd,grd->...gr", core_attn_out, wo_a_weight
-        )
+        from paddlefleet.triton_ops import fused_grouped_matmul
+
+        core_attn_out = fused_grouped_matmul(core_attn_out, wo_a_weight)
         core_attn_out = core_attn_out.reshape([b, sq, -1])
 
         # Apply gated attention

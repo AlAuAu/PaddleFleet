@@ -16,6 +16,8 @@ from .fused_mla_yarn_rope_apply import (
     fused_apply_mla_rope_for_kv,
     fused_apply_mla_rope_for_q,
 )
+from .fused_yarn_rope_freqs import fused_yarn_rope_freqs
+from .grouped_matmul_fusion import GroupedMatmulTriton, fused_grouped_matmul
 from .mla_rope_inplace_fusion import fused_apply_mla_rope_inplace
 from .moe_topk_fusion import MoETopkFusion, routing_map_fusion_forward
 from .rms_norm_fusion import RMSNormFusionTriton
@@ -30,6 +32,9 @@ from .ulysses_alltoall_fused import (
 )
 
 __all__ = [
+    "fused_yarn_rope_freqs",
+    "GroupedMatmulTriton",
+    "fused_grouped_matmul",
     "RMSNormFusionTriton",
     "MoETopkFusion",
     "routing_map_fusion_forward",
