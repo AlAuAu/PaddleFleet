@@ -77,7 +77,12 @@ def _fleet_fp8_wo_a_gemm_enabled():
 FLEET_FP8_WO_A_GEMM = _fleet_fp8_wo_a_gemm_enabled()
 
 
-def _q_rms_norm(q: Tensor, eps: float, high_precision_norm: bool) -> Tensor:
+def _q_rms_norm(
+    q: Tensor,
+    eps: float,
+    high_precision_norm: bool,
+    use_fusion: bool = False,
+) -> Tensor:
     """RMS normalization for query (no learnable weight)."""
     if high_precision_norm:
         ori_dtype = q.dtype
@@ -85,7 +90,13 @@ def _q_rms_norm(q: Tensor, eps: float, high_precision_norm: bool) -> Tensor:
         q = q * paddle.rsqrt(q.square().mean(-1, keepdim=True) + eps)
         return q.astype(ori_dtype)
     else:
-        return q * paddle.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+        if use_fusion:
+            from paddlefleet.triton_ops import fused_q_rms_norm
+
+            result = fused_q_rms_norm(q, eps=eps)
+        else:
+            result = q * paddle.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+        return result
 
 
 def _quant_blockwise(x: Tensor, quant_method: str):
@@ -1130,6 +1141,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             q,
             getattr(self.config, "rms_norm_eps", 1e-5),
             high_precision_norm=self.config.swa_high_precision_norm,
+            use_fusion=getattr(self.config, "dsv4_q_rms_norm_fusion", False),
         )
 
         # KV path
