@@ -410,6 +410,10 @@ class TransformerConfig(ModelParallelConfig):
     sigmoid_gate_fusion: bool = False
     """If True, use Triton fused sigmoid gate kernel."""
 
+    dsv4_q_rms_norm_fusion: bool = False
+    """If True, use the Triton weight-free fused kernel for query RMS norm in the
+    DSV4 hybrid attention path. Only takes effect when swa_high_precision_norm=False."""
+
     ####################
     # activation recomputation
     ####################
