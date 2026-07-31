@@ -18,6 +18,7 @@ from .fused_mla_yarn_rope_apply import (
 )
 from .mla_rope_inplace_fusion import fused_apply_mla_rope_inplace
 from .moe_topk_fusion import MoETopkFusion, routing_map_fusion_forward
+from .q_rms_norm_fusion import fused_q_rms_norm
 from .rms_norm_fusion import RMSNormFusionTriton
 from .sigmoid_gate_fusion import SigmoidGateFusionTriton
 from .ue8m0_scale_transpose_fusion import (
@@ -30,6 +31,7 @@ from .ulysses_alltoall_fused import (
 )
 
 __all__ = [
+    "fused_q_rms_norm",
     "RMSNormFusionTriton",
     "MoETopkFusion",
     "routing_map_fusion_forward",

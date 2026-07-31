@@ -16,6 +16,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import paddle
 from paddle.distributed.fleet.meta_parallel import build_spec_layer
 
@@ -2141,6 +2142,145 @@ class TestDSv4PackedForwardBackwardEquivalence(unittest.TestCase):
                 attention_mask=None,
                 attn_mask_startend_row_indices=startend,
             )
+
+
+@unittest.skipIf(
+    not paddle.is_compiled_with_cuda()
+    or paddle.device.cuda.get_device_capability()[0] < 8,
+    "dsv4_q_rms_norm_fusion requires GPU with SM80+ (bf16 Triton kernel)",
+)
+class TestDSv4QRMSNormFusionIntegration(unittest.TestCase):
+    """Integration regression for the ``dsv4_q_rms_norm_fusion`` switch.
+
+    Unlike the standalone kernel test (which calls ``fused_q_rms_norm``
+    directly), this exercises the real user path: the config field flowing
+    into ``DSv4HybridSelfAttention.get_query_key_value_tensors`` and reaching
+    ``_q_rms_norm(..., use_fusion=...)``. It guards against the field->call-site
+    wiring being broken (which numeric-only checks miss, since the fused kernel
+    is bit-exact with the eager path).
+    """
+
+    # Use the real production head dim so strides/reshape match training.
+    _V_HEAD_DIM = 128
+    _NUM_HEADS = 2
+    _HIDDEN = 256
+    _SEQ = 64
+
+    def _build(self, use_fusion):
+        config = _make_config(
+            hidden_size=self._HIDDEN,
+            num_attention_heads=self._NUM_HEADS,
+            v_head_dim=self._V_HEAD_DIM,
+            q_lora_rank=64,
+            o_groups=2,
+            o_lora_rank=32,
+            num_layers=1,
+            csa_compress_ratios=[4],
+        )
+        # High-precision norm bypasses the fused path; keep it off so the
+        # switch actually takes effect.
+        self.assertFalse(config.swa_high_precision_norm)
+        config.dsv4_q_rms_norm_fusion = use_fusion
+        model_parallel_cuda_manual_seed(_SEED)
+        return _build_attention(config, layer_number=0)
+
+    def _make_hidden(self):
+        # Leaf tensor (stop_gradient default True); callers derive their own
+        # leaf via _leaf_clone so hidden.grad is retained.
+        return paddle.randn([1, self._SEQ, self._HIDDEN], dtype="bfloat16")
+
+    @staticmethod
+    def _leaf_clone(base):
+        h = base.clone()
+        h.stop_gradient = False
+        return h
+
+    def _forward_backward_query(self, attn, hidden):
+        query = attn.get_query_key_value_tensors(hidden)[0]
+        query.astype("float32").sum().backward()
+        return query, hidden.grad
+
+    def test_fusion_enabled_invokes_fused_kernel_and_matches_eager(self):
+        from paddlefleet import triton_ops
+
+        real_fused = triton_ops.fused_q_rms_norm
+        calls = {"n": 0}
+
+        def _spy(*args, **kwargs):
+            calls["n"] += 1
+            return real_fused(*args, **kwargs)
+
+        # Eager reference (fusion off) — ground truth for the query tensor.
+        eager_attn = self._build(use_fusion=False)
+        # Fused module with identical weights.
+        fused_attn = self._build(use_fusion=True)
+        fused_attn.set_state_dict(eager_attn.state_dict())
+        eager_attn.train()
+        fused_attn.train()
+
+        hidden = self._make_hidden()
+        eager_hidden = self._leaf_clone(hidden)
+        fused_hidden = self._leaf_clone(hidden)
+
+        eager_query, eager_grad = self._forward_backward_query(
+            eager_attn, eager_hidden
+        )
+
+        with patch.object(triton_ops, "fused_q_rms_norm", _spy):
+            fused_query, fused_grad = self._forward_backward_query(
+                fused_attn, fused_hidden
+            )
+
+        # Wiring: the switch must actually route through the fused kernel.
+        self.assertGreaterEqual(
+            calls["n"],
+            1,
+            "dsv4_q_rms_norm_fusion=True did not reach fused_q_rms_norm; "
+            "config field -> call-site wiring is broken",
+        )
+        self.assertListEqual(
+            list(fused_query.shape),
+            [1, self._SEQ, self._NUM_HEADS, self._V_HEAD_DIM],
+        )
+        # The standalone kernel test asserts bit-exactness; here we only need
+        # end-to-end numerical agreement within bf16 rounding (~1 ULP) after
+        # the fused query flows through the rest of the branch.
+        np.testing.assert_allclose(
+            fused_query.astype("float32").numpy(),
+            eager_query.astype("float32").numpy(),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        np.testing.assert_allclose(
+            fused_grad.astype("float32").numpy(),
+            eager_grad.astype("float32").numpy(),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
+    def test_fusion_disabled_does_not_invoke_fused_kernel(self):
+        from paddlefleet import triton_ops
+
+        real_fused = triton_ops.fused_q_rms_norm
+        calls = {"n": 0}
+
+        def _spy(*args, **kwargs):
+            calls["n"] += 1
+            return real_fused(*args, **kwargs)
+
+        attn = self._build(use_fusion=False)
+        attn.train()
+        hidden = self._leaf_clone(self._make_hidden())
+
+        with patch.object(triton_ops, "fused_q_rms_norm", _spy):
+            self._forward_backward_query(attn, hidden)
+
+        self.assertEqual(
+            calls["n"],
+            0,
+            "fused_q_rms_norm was called even though "
+            "dsv4_q_rms_norm_fusion=False",
+        )
 
 
 if __name__ == "__main__":
