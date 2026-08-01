@@ -56,6 +56,7 @@ from paddlefleet.transformer.dsv4_hybrid_attention import (
 )
 from paddlefleet.transformer.enums import AttnMaskType
 from paddlefleet.transformer.transformer_config import TransformerConfig
+from paddlefleet.triton_ops import fused_grouped_matmul
 
 _SEED = 42
 
@@ -1854,6 +1855,66 @@ class TestDSv4HybridAttentionForwardBackward(unittest.TestCase):
         )
         self.assertTrue(paddle.isfinite(output.float()).all().item())
 
+    def test_yarn_rope_fusion(self):
+        batch_size = 1
+        seq_len = 128
+        model_parallel_cuda_manual_seed(_SEED)
+        config = _make_config(rope_type="yarn", dsa_indexer_loss_coeff=1.0)
+        attn = _build_attention(config, layer_number=2)
+        attn.train()
+        hidden = paddle.randn(
+            [batch_size, seq_len, config.hidden_size],
+            dtype=paddle.bfloat16,
+        )
+        hidden.stop_gradient = False
+
+        def run(yarn_rope_fusion):
+            attn.rotary_pos_emb.yarn_rope_fusion = yarn_rope_fusion
+            attn.clear_gradients()
+            if hidden.grad is not None:
+                hidden.clear_gradient()
+
+            output, _ = attn(hidden_states=hidden, attention_mask=None)
+            output.cast("float32").sum().backward()
+
+            param_grads = {
+                name: param.grad.clone()
+                for name, param in attn.named_parameters()
+                if param.grad is not None
+            }
+            return output.clone(), hidden.grad.clone(), param_grads
+
+        unfused_out, unfused_hidden_grad, unfused_grads = run(False)
+        fused_out, fused_hidden_grad, fused_grads = run(True)
+
+        self.assertTrue(
+            paddle.allclose(
+                fused_out.cast("float32"),
+                unfused_out.cast("float32"),
+                rtol=1e-2,
+                atol=1e-2,
+            ).item()
+        )
+        self.assertTrue(
+            paddle.allclose(
+                fused_hidden_grad.cast("float32"),
+                unfused_hidden_grad.cast("float32"),
+                rtol=1e-2,
+                atol=1e-2,
+            ).item()
+        )
+        self.assertEqual(set(fused_grads.keys()), set(unfused_grads.keys()))
+        for name in unfused_grads:
+            self.assertTrue(
+                paddle.allclose(
+                    fused_grads[name].cast("float32"),
+                    unfused_grads[name].cast("float32"),
+                    rtol=1e-2,
+                    atol=1e-2,
+                ).item(),
+                f"Gradient mismatch for parameter {name}",
+            )
+
     def test_gated_attention(self):
         batch_size = 1
         seq_len = 64
@@ -2437,6 +2498,75 @@ class TestDSv4QRMSNormFusionIntegration(unittest.TestCase):
             "fused_q_rms_norm was called even though "
             "dsv4_q_rms_norm_fusion=False",
         )
+
+
+@unittest.skipUnless(
+    paddle.is_compiled_with_cuda(), "fused_grouped_matmul requires CUDA/Triton"
+)
+class TestFusedGroupedMatmul(unittest.TestCase):
+    """Regression tests for fused_grouped_matmul vs paddle.einsum oracle.
+
+    The fused kernel replaces paddle.einsum("...gd,grd->...gr", x, w). These
+    tests use that einsum as the oracle and compare forward output, x.grad and
+    w.grad. Shapes are deliberately chosen so M (=b*sq), R and D are not
+    multiples of the Triton tile sizes (64/128), exercising the mask paths.
+    """
+
+    # M=b*sq=130, R=70, D=100: all cross a tile boundary and are non-divisible.
+    _B, _SQ, _G, _D, _R = 2, 65, 3, 100, 70
+
+    def _compare_against_einsum(self, dtype):
+        model_parallel_cuda_manual_seed(_SEED)
+        x = paddle.randn([self._B, self._SQ, self._G, self._D], dtype="float32")
+        w = paddle.randn([self._G, self._R, self._D], dtype="float32")
+        grad_out = paddle.randn(
+            [self._B, self._SQ, self._G, self._R], dtype="float32"
+        )
+
+        def run(fn):
+            xi = x.astype(dtype).detach()
+            wi = w.astype(dtype).detach()
+            xi.stop_gradient = False
+            wi.stop_gradient = False
+            out = fn(xi, wi)
+            (out.astype("float32") * grad_out).sum().backward()
+            return out, xi.grad, wi.grad
+
+        fused_out, fused_dx, fused_dw = run(fused_grouped_matmul)
+        ref_out, ref_dx, ref_dw = run(
+            lambda a, b: paddle.einsum("...gd,grd->...gr", a, b)
+        )
+
+        self.assertEqual(
+            list(fused_out.shape),
+            [self._B, self._SQ, self._G, self._R],
+        )
+        for fused, ref, name in [
+            (fused_out, ref_out, "output"),
+            (fused_dx, ref_dx, "x.grad"),
+            (fused_dw, ref_dw, "w.grad"),
+        ]:
+            self.assertTrue(
+                paddle.allclose(
+                    fused.astype("float32"),
+                    ref.astype("float32"),
+                    rtol=1e-2,
+                    atol=1e-2,
+                ).item(),
+                msg=f"{name} mismatch for dtype={dtype}",
+            )
+
+    def test_bf16_matches_einsum(self):
+        self._compare_against_einsum(paddle.bfloat16)
+
+    def test_fp16_matches_einsum(self):
+        self._compare_against_einsum(paddle.float16)
+
+    def test_dtype_mismatch_raises(self):
+        x = paddle.randn([1, 4, self._G, self._D], dtype="bfloat16")
+        w = paddle.randn([self._G, self._R, self._D], dtype="float16")
+        with self.assertRaises(ValueError):
+            fused_grouped_matmul(x, w)
 
 
 if __name__ == "__main__":
