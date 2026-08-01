@@ -413,6 +413,10 @@ class TransformerConfig(ModelParallelConfig):
     dsv4_q_rms_norm_fusion: bool = False
     """If True, use the Triton weight-free fused kernel for query RMS norm in the
     DSV4 hybrid attention path. Only takes effect when swa_high_precision_norm=False."""
+    dsv4_yarn_rope_fusion: bool = False
+    """If True, use the Triton fused kernel to build the YaRN RoPE frequency table
+    in the DSV4 hybrid attention path. Only the DSV4 hybrid attention path reads this
+    field; the standard MLA / DSA YaRN paths ignore it."""
 
     ####################
     # activation recomputation
