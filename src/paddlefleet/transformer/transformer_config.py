@@ -499,7 +499,7 @@ class TransformerConfig(ModelParallelConfig):
     """MoE Feed-Forward Network hidden size"""
 
     topk_method: str = "greedy"
-    """Options are greedy, group_limited_greedy, no_auxtc"""
+    """Options are greedy, group_limited_greedy, noaux_tc, quantile_balancing"""
 
     moe_token_dispatcher_type: str = "deepep"
     """The type of token dispatcher to use. The default is 'deepep'.
@@ -514,7 +514,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use fusion node for MoE layer. Default is True"""
 
     moe_router_load_balancing_type: str = "aux_loss"
-    """"Options are aux_loss, seq_aux_loss, global_aux_loss, sinkhorn"""
+    """"Options are aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, none.
+    Use 'none' together with router_aux_loss_coef=0 when the router balances
+    load on its own (required by topk_method='quantile_balancing')."""
 
     moe_layer_freq: int | list[int] | None = None
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -604,6 +606,11 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_router_force_load_balancing: bool = False
     """Force load balancing with random logits for MoE router."""
+
+    qb_n_bins: int = 1000
+    """Number of histogram bins for Quantile Balancing. Only used when
+    topk_method='quantile_balancing'. Higher values give more precise
+    quantile estimation at the cost of slightly more communication."""
 
     moe_split_feature_routing: bool = False
     """Enable multi-view (split-feature) MoE routing. When True, the router
