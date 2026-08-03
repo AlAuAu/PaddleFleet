@@ -755,6 +755,11 @@ class DSv4HybridAttention(Attention):
             "attn_mask_startend_row_indices", None
         )
 
+        # KV cache (incremental decode): duck-typed CSADynamicCache.
+        past_key_values = kwargs.get("past_key_values", None)
+        layer_idx = kwargs.get("layer_idx", None)
+        use_cache = kwargs.get("use_cache", False)
+
         # Get Q, K, V tensors
         # In CP mode, pass position_offset so RoPE uses correct global positions.
         cp_pg = getattr(self, "pg_collection", None)
@@ -784,6 +789,13 @@ class DSv4HybridAttention(Attention):
         b, sq, _ = hidden_states.shape
         position_offset = cp_rank * sq if cp_size > 1 else 0
 
+        # Incremental decode: the new token's absolute position is the number
+        # of raw tokens already cached; RoPE (forward + inverse) must use it.
+        if use_cache and past_key_values is not None and cp_size == 1:
+            position_offset = past_key_values.get_csa_state(
+                layer_idx
+            ).raw_seq_len()
+
         docmask_meta = None
         ratio = int(getattr(self.core_attention, "compress_ratio", 0))
         if startend_row_indices is not None:
@@ -809,7 +821,7 @@ class DSv4HybridAttention(Attention):
                 position_offset,
                 docmask_meta,
                 input_ids,
-                True,  # _in_full_recompute
+                True,  # _in_full_recompute (last positional; see signature)
                 preserve_rng_state=False,
                 share_grad_holder=True,
             )
@@ -829,6 +841,9 @@ class DSv4HybridAttention(Attention):
                 position_offset,
                 docmask_meta,
                 input_ids,
+                past_key_values=past_key_values,
+                layer_idx=layer_idx,
+                use_cache=use_cache,
             )
 
             # Output projection
@@ -857,6 +872,10 @@ class DSv4HybridAttention(Attention):
         docmask_meta,
         input_ids,
         _in_full_recompute: bool = False,
+        *,
+        past_key_values=None,
+        layer_idx=None,
+        use_cache=False,
     ) -> Tensor:
         """Full attention forward: qkv_proj + core_attn + inv_rope + o_group_proj + gated_attn.
 
@@ -864,6 +883,12 @@ class DSv4HybridAttention(Attention):
         The large intermediate tensors (query, key, value) are internal to this function
         and will be freed after this function returns during forward, then recomputed
         during backward.
+
+        ``RecomputeWithoutOutput.recompute()`` forwards only ``*args`` to the
+        wrapped function, so ``_in_full_recompute`` must stay the *last*
+        positional parameter. The KV-cache parameters after it are keyword-only
+        to keep that invariant: they are never used from the recompute path
+        (recompute only runs under ``self.training``).
         """
         query, key, value, q_compressed, kv_compressed = (
             self.get_query_key_value_tensors(
@@ -883,6 +908,9 @@ class DSv4HybridAttention(Attention):
             qr=q_compressed,
             input_ids=input_ids,
             docmask_meta=docmask_meta,
+            past_key_values=past_key_values,
+            layer_idx=layer_idx,
+            use_cache=use_cache,
         )
         # core_attn_out: [b, sq, np * v_head_dim]
 
