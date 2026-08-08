@@ -432,6 +432,32 @@ class TransformerConfig(ModelParallelConfig):
     dsv4_q_rms_norm_fusion: bool = False
     """If True, use the Triton weight-free fused kernel for query RMS norm in the
     DSV4 hybrid attention path. Only takes effect when swa_high_precision_norm=False."""
+
+    dsa_sink_grad_fusion: bool = False
+    """Whether to use the fused Triton attention-sink gradient epilogue.
+
+    Scope: ``MQALatentAttention`` (``non_absorbed_mqa``) only. It is read in
+    ``MQALatentAttention.__init__`` and forwarded from ``_sparse_attn``. HySparse's
+    DSA gather (``paddlefleet.cudnn_ops.block_sparse_mqa_attention_dsa``) shares
+    the same ``mqa_sparse_attn`` entry and can also carry a learnable sink, but it
+    deliberately does not forward this flag: it stays on the eager epilogue no
+    matter how this field is set.
+
+    The sparse-attention backward computes ``d_sink`` analytically because the
+    SM100 cuDNN DSA backward returns an all-zero ``d_sink``. The eager
+    implementation materialises three ``[b, s, h, d_v]`` fp32 temporaries to
+    produce ``[h]`` numbers; the kernel reads ``out``/``do`` once in their native
+    dtype. Measured at b=1/s=8192/h=64/d_v=512: 2.664 ms -> 0.423 ms, transient
+    3.0 GiB -> ~0.
+
+    No effect on layers without a learnable sink (``add_full_attention_sink_bias``
+    off), which have no sink gradient to compute.
+
+    Not bitwise identical to the eager path: 1.9e-7 relative to the gradient
+    vector's own scale (~1.6 fp32 ulp), entirely from the fp32 summation order of
+    ``Delta = sum_dv(out * do)``. Both paths are deterministic run-to-run.
+    """
+
     dsv4_yarn_rope_fusion: bool = False
     """If True, use the Triton fused kernel to build the YaRN RoPE frequency table
     in the DSV4 hybrid attention path. Only the DSV4 hybrid attention path reads this

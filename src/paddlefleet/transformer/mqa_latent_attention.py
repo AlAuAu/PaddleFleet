@@ -269,6 +269,9 @@ class MQALatentAttention(FleetLayer):
             else config.num_attention_heads,
             is_swa,
         )
+        # Fused Triton epilogue for the analytic sink gradient. Only reachable
+        # when ``softmax_offset`` exists; a sinkless layer has no sink gradient.
+        self.sink_grad_fusion = getattr(config, "dsa_sink_grad_fusion", False)
 
     def _needs_indexer_loss(self) -> bool:
         """Whether this forward should build and attach the indexer loss.
@@ -775,6 +778,7 @@ class MQALatentAttention(FleetLayer):
             d_v,
             attn_sink=self.softmax_offset,
             indexer_topk=indexer_topk,
+            sink_grad_fusion=self.sink_grad_fusion,
         )
 
     @staticmethod
