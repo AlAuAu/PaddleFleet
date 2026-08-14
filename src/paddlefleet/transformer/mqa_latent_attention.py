@@ -218,6 +218,191 @@ class MQALatentAttentionSublayersSpec:
     indexer: LayerSpec | type = None
 
 
+@dataclass
+class MQADocMeta:
+    """Document-mask derivations for the ``-2`` (absorbed-MQA) layers.
+
+    A pure function of ``(attn_mask_startend_row_indices, seqlen)``: no
+    randomness, no collectives, every output an index/bound table with
+    ``stop_gradient``. ``seqlen`` is always the *global* sequence length
+    (``s_local * cp_size``) and every table is built over it, so column values
+    stay global token ids -- which is what the kernels expect, the KV being
+    all-gathered. Rows are sliced to the local CP rank on the way out.
+
+    ``CSADocMaskMetadata`` deliberately does **not** stand in for this. Two
+    thirds of it is compression semantics, its ``build`` pays a ``.item()`` for a
+    compression bound, and under ``csa_dense_mode`` -- which the layer43 configs
+    set -- its ``is_valid`` / ``doc_lens`` / ``doc_starts`` are all ``None``
+    (``csa_attention.py:512-521``), which are exactly the fields needed here.
+    Its ``doc_start_per_pos`` also comes from a different boundary rule in that
+    mode (``document_mask_triton`` rather than ``_derive_csa_doc_boundaries``).
+
+    The derived tables are cached per distinct argument. That only pays off when
+    one instance is shared by the ``-2`` layers of a micro-batch, which is what
+    ``csa_share_docmask_meta`` arranges (see ``doc_mask_meta_registry``); with the
+    switch off every forward builds its own instance, no cache ever hits and the
+    work per layer is what it was before this class existed.
+    """
+
+    batch_size: int
+    seqlen: int
+    doc_start_per_pos: Tensor
+    doc_len_per_pos: Tensor
+    is_valid: Tensor
+    doc_lens: Tensor
+    _window_topk_idxs: Tensor | None = None
+    _window_size: int | None = None
+    _valid_range: dict[int, tuple[Tensor, Tensor]] | None = None
+    _cu_seqlens_arg: tuple[list[int] | None] | None = None
+
+    @classmethod
+    def build(
+        cls, row_end: Tensor | None, batch_size: int, seqlen: int
+    ) -> MQADocMeta:
+        """Derive the boundary tables from the document mask.
+
+        ``row_end is None`` means "one document covering everything", the same
+        fallback the layer used inline.
+        """
+        with paddle.no_grad():
+            if row_end is None:
+                row_end = paddle.full(
+                    [batch_size, 1, seqlen, 1], seqlen, dtype="int32"
+                )
+            _validate_csa_docmask_shape(row_end, batch_size, seqlen)
+            doc_start, doc_len, is_valid, doc_lens, _ = (
+                _derive_csa_doc_boundaries(row_end, seqlen)
+            )
+        return cls(
+            batch_size=int(batch_size),
+            seqlen=int(seqlen),
+            doc_start_per_pos=doc_start,
+            doc_len_per_pos=doc_len,
+            is_valid=is_valid,
+            doc_lens=doc_lens,
+        )
+
+    # ------------------------------------------------------------------
+    # Derived tables. Each comes in two halves on purpose: a ``_global_*``
+    # builder that is a pure function of the document mask (no CP rank enters
+    # it, every rank derives the same table, and that is what gets cached), and
+    # a public accessor that takes this rank's row range out of it. The prebuild
+    # only ever calls the ``_global_*`` half, so it needs no rank information;
+    # the layers call the public half with their real ``(position_offset,
+    # s_local)``.
+    # ------------------------------------------------------------------
+    def _global_window_topk_idxs(self, window_size: int) -> Tensor:
+        """Cached ``[b, seqlen, window_size]`` int32 sliding-window column ids."""
+        window_size = int(window_size)
+        if self._window_topk_idxs is None or self._window_size != window_size:
+            with paddle.no_grad():
+                self._window_topk_idxs = (
+                    _build_window_topk_idxs_from_doc_bounds(
+                        self.batch_size,
+                        self.seqlen,
+                        window_size,
+                        self.doc_start_per_pos,
+                        self.is_valid,
+                    ).cast("int32")
+                )
+            self._window_size = window_size
+        return self._window_topk_idxs
+
+    def window_topk_idxs(
+        self, window_size: int, position_offset: int, s_local: int
+    ) -> Tensor:
+        """``[b, s_local, window_size]`` int32, this rank's rows."""
+        idxs = self._global_window_topk_idxs(window_size)
+        if int(s_local) != self.seqlen:
+            idxs = idxs[:, position_offset : position_offset + int(s_local)]
+        return idxs
+
+    def _global_valid_range(self, window: int) -> tuple[Tensor, Tensor]:
+        """Cached ``([seqlen, 2] int32 range, [seqlen] available count)``.
+
+        ``window`` is how many trailing causal tokens to exclude: the sparse
+        phase passes the forced local window it adds separately, the warmup phase
+        passes ``0`` because its candidate set is the whole causal span. Cached
+        per ``window`` since a layer only ever asks for one of the two.
+        """
+        window = int(window)
+        if self._valid_range is None:
+            self._valid_range = {}
+        cached = self._valid_range.get(window)
+        if cached is None:
+            with paddle.no_grad():
+                positions = paddle.arange(self.seqlen, dtype="int64")
+                causal_avail = paddle.minimum(
+                    positions - self.doc_start_per_pos + 1, self.doc_len_per_pos
+                )
+                n_avail = paddle.clip(causal_avail - window, min=0)
+                n_avail = paddle.where(
+                    self.is_valid, n_avail, paddle.zeros_like(n_avail)
+                )
+                valid_range = paddle.stack(
+                    [self.doc_start_per_pos, self.doc_start_per_pos + n_avail],
+                    axis=-1,
+                ).cast("int32")
+            cached = (valid_range, n_avail)
+            self._valid_range[window] = cached
+        return cached
+
+    def indexer_valid_range(
+        self, window: int, position_offset: int, s_local: int
+    ) -> tuple[Tensor, Tensor]:
+        """``(valid_range [1, s_local, 2] int32, row_empty [1, s_local, 1])``."""
+        valid_range, n_avail = self._global_valid_range(window)
+        if int(s_local) != self.seqlen:
+            valid_range = valid_range[
+                position_offset : position_offset + int(s_local)
+            ]
+            n_avail = n_avail[position_offset : position_offset + int(s_local)]
+        rows = int(valid_range.shape[0])
+        return valid_range.unsqueeze(0), (n_avail == 0).reshape([1, rows, 1])
+
+    def cu_seqlens_arg(self) -> list[int] | None:
+        """Host-side ``cu_seqlens`` for the cuDNN indexer's THD fast path.
+
+        ``None`` when the documents do not exactly tile the sequence, in which
+        case the caller falls back to the dense path. Costs two D2H syncs, which
+        is why the result is cached -- wrapped in a 1-tuple because ``None`` is
+        itself a valid answer and cannot double as "not computed yet".
+        """
+        if self._cu_seqlens_arg is None:
+            self._cu_seqlens_arg = (
+                self.doc_lens.tolist()
+                if int(self.doc_lens.sum()) == self.seqlen
+                else None,
+            )
+        return self._cu_seqlens_arg[0]
+
+    def warm(self, window_size: int) -> None:
+        """Build the cheap tables now so no layer builds them inside the forward.
+
+        Called by the prebuild, i.e. before ``forward_backward_pipeline``, so the
+        builds and the ``cu_seqlens`` D2H syncs stay off the steady-state pipeline
+        schedule where they cost bubble time.
+
+        Only the ``_global_*`` halves are called, so no CP rank information is
+        needed here: what gets cached is the rank-independent table and each layer
+        slices its own rows out of it later. Both window widths are warmed (the
+        sparse phase asks for ``csa_window_size``, the warmup phase for ``0``)
+        because the phase is not known at this level; together they cost
+        ``seqlen * (window_size + 4)`` bytes.
+
+        Everything this class holds is ``O(seqlen)`` or ``O(seqlen *
+        window_size)``, so warming all of it is cheap. The one ``O(seqlen^2)``
+        table latent MQA used to need -- the per-document causal column ids -- is
+        gone: both non-sparse phases now run as dense FA4 flashmask off
+        ``attn_mask_startend_row_indices`` (``_dense_attn``) and build no table at
+        all.
+        """
+        self._global_window_topk_idxs(window_size)
+        self._global_valid_range(window_size)
+        self._global_valid_range(0)
+        self.cu_seqlens_arg()
+
+
 class MQALatentAttention(FleetLayer):
     """Sparse attention on the absorbed MLA KV latent (``core_attention``).
 
@@ -247,6 +432,15 @@ class MQALatentAttention(FleetLayer):
 
         DSAIndexerLossLoggingHelper.register_total_num_layers(config)
         self.layer_number = layer_number
+        # Which logical document mask this layer reads, i.e. the mask group half
+        # of the shared-metadata slot key. Derived here rather than assumed at
+        # the lookup: the trainer only prebuilds ``("main",)``, so an MTP layer
+        # asking for its own group misses and falls back to building privately --
+        # which is correct. Hardcoding ``("main",)`` at the lookup would instead
+        # hand an MTP layer metadata built from the *decoder* mask, silently.
+        self.docmask_mask_group = (
+            ("mtp", int(layer_number)) if is_mtp_layer else ("main",)
+        )
         self.attn_mask_type = attn_mask_type
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -402,6 +596,7 @@ class MQALatentAttention(FleetLayer):
         q_absorbed: Tensor | None = None,
         v_b_proj_weight: Tensor | None = None,
         input_ids: Tensor | None = None,
+        docmask_mb_idx: int = -1,
     ) -> Tensor:
         """Absorbed-MQA forward.
 
@@ -492,9 +687,34 @@ class MQALatentAttention(FleetLayer):
                     [b, 1, s_global, 1], s_global, dtype="int32"
                 )
             _validate_csa_docmask_shape(row_end, b, s_global)
-            doc_start, doc_len, is_valid, doc_lens, _ = (
-                _derive_csa_doc_boundaries(row_end, s_global)
+
+        # Document-mask derivations. ``docmask_mb_idx >= 0`` plus the switch means
+        # the trainer prebuilt this micro-batch's slot before the forward and the
+        # ``-2`` layers of this mask group share it. A miss returns ``None`` -- an
+        # MTP layer's group is never prebuilt -- and so does the switch being off
+        # or inference; in every one of those cases everything below runs the
+        # pre-existing code untouched.
+        #
+        # ``row_end`` itself stays outside: the dense-FA4 phases pass it to the
+        # kernel as the mask, so it is needed either way, and normalising it is
+        # ``O(1)`` -- the part worth sharing is ``_derive_csa_doc_boundaries``.
+        meta = None
+        doc_start = doc_len = is_valid = doc_lens = None
+        if docmask_mb_idx >= 0 and getattr(
+            self.config, "mqa_share_docmask_meta", False
+        ):
+            from paddlefleet.transformer.doc_mask_meta_registry import (
+                doc_mask_meta_registry,
             )
+
+            meta = doc_mask_meta_registry.get_mqa(
+                docmask_mb_idx, b, s_global, self.docmask_mask_group
+            )
+        if meta is None:
+            with paddle.no_grad():
+                doc_start, doc_len, is_valid, doc_lens, _ = (
+                    _derive_csa_doc_boundaries(row_end, s_global)
+                )
 
         phase = self._phase()
         if phase == "full_causal":
@@ -522,6 +742,7 @@ class MQALatentAttention(FleetLayer):
                 s,
                 s_global,
                 row_end,
+                meta=meta,
             )
 
         return self._forward_sparse(
@@ -537,6 +758,7 @@ class MQALatentAttention(FleetLayer):
             kv_lora_rank,
             input_ids,
             position_offset,
+            meta=meta,
         )
 
     # ------------------------------------------------------------------
@@ -590,6 +812,7 @@ class MQALatentAttention(FleetLayer):
         s_local: int,
         s_global: int,
         row_end: Tensor,
+        meta: MQADocMeta | None = None,
     ) -> Tensor:
         """Phase 2: frozen backbone, full-causal attention, full-causal KL.
 
@@ -663,15 +886,20 @@ class MQALatentAttention(FleetLayer):
         with paddle.no_grad():
             # No forced window in this phase, so the candidate range is the
             # whole per-document causal span.
-            valid_range, row_empty = self._indexer_valid_range(
-                s_global,
-                doc_start,
-                doc_len,
-                is_valid,
-                position_offset,
-                s_local,
-                window=0,
-            )
+            if meta is not None:
+                valid_range, row_empty = meta.indexer_valid_range(
+                    0, position_offset, s_local
+                )
+            else:
+                valid_range, row_empty = self._indexer_valid_range(
+                    s_global,
+                    doc_start,
+                    doc_len,
+                    is_valid,
+                    position_offset,
+                    s_local,
+                    window=0,
+                )
             columns, probs = csa_indexer_topk_fwd(
                 index_q.detach(),
                 index_k.detach(),
@@ -1069,6 +1297,7 @@ class MQALatentAttention(FleetLayer):
         kv_lora_rank,
         input_ids=None,
         position_offset=0,
+        meta=None,
     ) -> Tensor:
         """Phase 3: attention consumes window + top-k, KL on that same set.
 
@@ -1094,16 +1323,24 @@ class MQALatentAttention(FleetLayer):
         need_loss = self._needs_indexer_loss()
 
         with paddle.no_grad():
-            window_idxs = _build_window_topk_idxs_from_doc_bounds(
-                b, s_global, self.window_size, doc_start, is_valid
-            ).cast("int32")
-            if self.cp_enabled:
-                window_idxs = window_idxs[
-                    :, position_offset : position_offset + s
-                ]
-            valid_range, row_empty = self._indexer_valid_range(
-                s_global, doc_start, doc_len, is_valid, position_offset, s
-            )
+            if meta is not None:
+                window_idxs = meta.window_topk_idxs(
+                    self.window_size, position_offset, s
+                )
+                valid_range, row_empty = meta.indexer_valid_range(
+                    self.window_size, position_offset, s
+                )
+            else:
+                window_idxs = _build_window_topk_idxs_from_doc_bounds(
+                    b, s_global, self.window_size, doc_start, is_valid
+                ).cast("int32")
+                if self.cp_enabled:
+                    window_idxs = window_idxs[
+                        :, position_offset : position_offset + s
+                    ]
+                valid_range, row_empty = self._indexer_valid_range(
+                    s_global, doc_start, doc_len, is_valid, position_offset, s
+                )
 
         q_idx, k_idx, w_idx = self._indexer_projections(
             x, qr, position_offset, grad_enabled=need_loss
@@ -1127,7 +1364,11 @@ class MQALatentAttention(FleetLayer):
         # ``seq_offset`` to pick out the documents this rank queries
         # (csa_indexer_fwd_cudnn.py:407-466).
         doc_lens_arg = (
-            doc_lens.tolist() if int(doc_lens.sum()) == s_global else None
+            meta.cu_seqlens_arg()
+            if meta is not None
+            else (
+                doc_lens.tolist() if int(doc_lens.sum()) == s_global else None
+            )
         )
 
         with paddle.no_grad():
