@@ -714,6 +714,16 @@ class TransformerLayer(nn.Layer):
     def transformer_layer_weights(self):
         return self.named_parameters()
 
+    def _docmask_meta_kwargs(self):
+        """Hook for the shared CSA document-mask metadata; opted out by default.
+
+        Overridden by ``HyperConnectionTransformerLayer``, which is the layer
+        class the DSv4-hybrid models use. Returning ``{}`` means ``_forward_impl``
+        is called with exactly the arguments it was called with before, so every
+        other layer class keeps building its own ``CSADocMaskMetadata``.
+        """
+        return {}
+
     def forward(
         self,
         dict_args: dict,
@@ -877,6 +887,12 @@ class TransformerLayer(nn.Layer):
             # Remove blocks from dict_args so that _forward_impl does not
             # receive unused tensors that cause backward errors.
             dict_args.pop("blocks", None)
+        # Shared CSA document-mask metadata (see _docmask_meta_kwargs). Taken HERE,
+        # outside the recompute wrapper below: `forward` runs exactly once per
+        # (layer, micro-batch) whatever the recompute granularity is, while
+        # `_forward_impl` may be replayed. Empty dict for every layer class that
+        # does not opt in.
+        docmask_meta_kwargs = self._docmask_meta_kwargs()
 
         if self.full_recompute or (not has_recovered()):
             hidden_states = dict_args["hidden_states"]
@@ -973,10 +989,11 @@ class TransformerLayer(nn.Layer):
                     input_ids=input_ids,
                     origin_input_ids=origin_input_ids,
                     **cu_seqlens_kwargs,
+                    **docmask_meta_kwargs,
                     **offload_kwargs,
                 )
         else:
-            outputs = self._forward_impl(**dict_args)
+            outputs = self._forward_impl(**dict_args, **docmask_meta_kwargs)
 
         if isinstance(outputs, tuple):
             output, context = outputs[0], outputs[1]
@@ -1063,6 +1080,7 @@ class TransformerLayer(nn.Layer):
         origin_input_ids: Tensor | None = None,
         blocks: list | tuple | None = None,
         cu_seqlens: Tensor | None = None,
+        docmask_mb_idx: int = -1,
         **kwargs,
     ):
         def need_do_attention():
@@ -1134,6 +1152,7 @@ class TransformerLayer(nn.Layer):
                         in_recompute=self.full_recompute,
                         input_ids=input_ids,
                         cu_seqlens=cu_seqlens,
+                        docmask_mb_idx=docmask_mb_idx,
                         **kwargs,
                     )
 
@@ -1187,6 +1206,7 @@ class TransformerLayer(nn.Layer):
                         in_recompute=self.full_recompute,
                         input_ids=input_ids,
                         cu_seqlens=cu_seqlens,
+                        docmask_mb_idx=docmask_mb_idx,
                         **kwargs,
                     )
             self._log_md5(
@@ -1632,6 +1652,19 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # idempotent: already-colored base params are skipped.
         self._mark_shared_no_hook_params()
 
+        # Consumer identity for the shared CSA document-mask metadata
+        # (config.csa_share_docmask_meta): one forward counter per consumer, so
+        # virtual-pipeline interleaving across chunks cannot mix them up.
+        self._docmask_meta_key = (int(layer_number), bool(is_mtp_layer))
+        if getattr(config, "csa_share_docmask_meta", False) or getattr(
+            config, "mqa_share_docmask_meta", False
+        ):
+            from paddlefleet.transformer.doc_mask_meta_registry import (
+                doc_mask_meta_registry,
+            )
+
+            doc_mask_meta_registry.register(self._docmask_meta_key)
+
         # mHC forward recompute config
         self.recompute_mhc_forward = False
         if (
@@ -1788,6 +1821,33 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         span.discard_output_and_register_recompute(casted)
         return casted
 
+    def _docmask_meta_kwargs(self):
+        """Micro-batch slot for the shared CSA document-mask metadata, or ``{}``.
+
+        Overrides the base opt-out hook: the DSv4-hybrid models run on this layer
+        class, so this is where the sharing is enabled. Returns ``{}`` when
+        ``config.csa_share_docmask_meta`` is off, so the switched-off path calls
+        ``_forward_impl`` with exactly the arguments it did before.
+
+        Called from ``TransformerLayer.forward``, i.e. outside the recompute
+        wrapper: the counter must advance exactly once per (layer, micro-batch),
+        whereas ``_forward_impl`` may be replayed by recompute.
+        """
+        if not (
+            getattr(self.config, "csa_share_docmask_meta", False)
+            or getattr(self.config, "mqa_share_docmask_meta", False)
+        ):
+            return {}
+        from paddlefleet.transformer.doc_mask_meta_registry import (
+            doc_mask_meta_registry,
+        )
+
+        return {
+            "docmask_mb_idx": doc_mask_meta_registry.advance(
+                self._docmask_meta_key, self.training
+            )
+        }
+
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -1848,6 +1908,16 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if isinstance(self.self_attn, KimiDeltaAttention):
             # Built once per step by the embedding; None makes KDA build its own.
             extra_kwargs["cu_seqlens"] = kwargs.get("cu_seqlens")
+        # Micro-batch slot for the shared document-mask metadata, decided in
+        # ``forward`` (outside recompute) and only read here. This override is
+        # the ``_forward_attention`` that runs whenever enable_hyper_connections
+        # is set, which is the case for the DSv4-hybrid models. Both attention
+        # classes derive their own mask group, so an MTP layer simply misses the
+        # lookup (the trainer prebuilds no MTP group) and builds privately.
+        if isinstance(
+            self.self_attn, (DSv4HybridAttention, MultiLatentAttention)
+        ):
+            extra_kwargs["docmask_mb_idx"] = kwargs.get("docmask_mb_idx", -1)
 
         if isinstance(self.self_attn, MultiLatentAttention):
             attention_output_with_bias = self.self_attn(
