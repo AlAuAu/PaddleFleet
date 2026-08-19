@@ -323,5 +323,62 @@ class TestFusedComputeH(unittest.TestCase):
         self.assertIsNotNone(proj.grad)
 
 
+@unittest.skipUnless(is_cutile_available(), "cuTile not available")
+class TestFusedComputeHValidation(unittest.TestCase):
+    """Bad shapes must raise, and must not rely on ``assert``.
+
+    ``python -O`` strips asserts, and the kernel addresses the three output
+    segments at fixed offsets derived from ``n``. An unchecked ``P`` or bias
+    length would therefore be read out of bounds rather than rejected.
+    """
+
+    def _args(self, **over):
+        paddle.seed(29)
+        args = {
+            "proj": _rand(_S, _B, _P),
+            "r": _rand(_S, _B, 1).abs() + 1.0,
+            "alpha_pre": _rand(1),
+            "alpha_post": _rand(1),
+            "alpha_res": _rand(1),
+            "bias": _rand(_P),
+        }
+        args.update(over)
+        return args
+
+    def _call(self, **over):
+        from paddlefleet.fusions.fused_mhc_kernels import fused_compute_h
+
+        a = self._args(**over)
+        return fused_compute_h(
+            a["proj"],
+            a["r"],
+            a["alpha_pre"],
+            a["alpha_post"],
+            a["alpha_res"],
+            a["bias"],
+            _N,
+            _EPS,
+        )
+
+    def test_accepts_the_valid_shapes(self):
+        self._call()
+
+    def test_rejects_wrong_proj_width(self):
+        with self.assertRaisesRegex(ValueError, "proj last dim"):
+            self._call(proj=_rand(_S, _B, _P + 1))
+
+    def test_rejects_r_last_dim_not_one(self):
+        with self.assertRaisesRegex(ValueError, "r last dim"):
+            self._call(r=_rand(_S, _B, 2))
+
+    def test_rejects_disagreeing_leading_dims(self):
+        with self.assertRaisesRegex(ValueError, "leading dims"):
+            self._call(r=_rand(_S, _B + 1, 1))
+
+    def test_rejects_wrong_bias_length(self):
+        with self.assertRaisesRegex(ValueError, "bias must be"):
+            self._call(bias=_rand(_P - 1))
+
+
 if __name__ == "__main__":
     unittest.main()

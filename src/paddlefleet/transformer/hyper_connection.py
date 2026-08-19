@@ -340,8 +340,16 @@ class HyperConnectionModule(nn.Layer):
             self._proj_rms_op = fused_proj_rms
             # Unlike the cast fusion this one trades launches, not dtypes -- the
             # mapping head is only n*n + 2*n wide per token -- so it applies at
-            # either precision.
-            self._compute_h_op = fused_compute_h
+            # either high_precision_mhc setting. The accuracy-compatible kernel
+            # is a separate matter: it is a Megatron-alignment contract, and the
+            # fused head's FMA contraction and staged cross-token reductions
+            # break it, so that mode keeps the reference composition, exactly as
+            # the projection / aggregate / BDA sites already do.
+            self._compute_h_op = (
+                native_compute_h
+                if _use_accuracy_compatible_kernel()
+                else fused_compute_h
+            )
             # The mHC input, the residual and the layer output stay in their
             # incoming dtype; the kernels widen them in-register instead of the
             # block materializing fp32 copies. Gated on high_precision_mhc:
