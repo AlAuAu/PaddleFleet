@@ -832,7 +832,9 @@ class HyperConnectionContractLayer(FleetLayer):
         ):
             dict_args["mhc_multistream"] = hidden_states
 
-            if self.magic_send:
+            if self.magic_send or self.config.separate_mtp_input:
+                # hidden_states is the pure backbone output in both cases, so the
+                # whole tensor is contracted (no MTP chunks to split off).
                 # Expand mhc_multistream to num_mtp+1 slots; zeros will be overwritten by MTP layers.
                 dict_args["mhc_multistream"] = paddle.concat(
                     [hidden_states]
