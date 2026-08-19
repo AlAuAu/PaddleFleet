@@ -1942,20 +1942,27 @@ else:
             h_res: [..., n*n] u_res, unactivated
         """
         P = n * n + 2 * n
-        assert proj.shape[-1] == P, (
-            f"fused_compute_h: proj last dim must be n*n+2*n={P}, "
-            f"got {proj.shape[-1]} (proj.shape={list(proj.shape)})"
-        )
-        assert r.shape[-1] == 1, (
-            f"fused_compute_h: r last dim must be 1, got {list(r.shape)}"
-        )
-        assert list(r.shape[:-1]) == list(proj.shape[:-1]), (
-            f"fused_compute_h: r shape {list(r.shape)} and proj shape "
-            f"{list(proj.shape)} must agree on the leading dims"
-        )
-        assert bias.shape == [P], (
-            f"fused_compute_h: bias must be [{P}], got {list(bias.shape)}"
-        )
+        # Raised, not asserted: ``python -O`` strips asserts, and a wrong P or
+        # bias length then reaches a kernel that addresses the three output
+        # segments at fixed offsets, i.e. reads out of bounds.
+        if proj.shape[-1] != P:
+            raise ValueError(
+                f"fused_compute_h: proj last dim must be n*n+2*n={P}, "
+                f"got {proj.shape[-1]} (proj.shape={list(proj.shape)})"
+            )
+        if r.shape[-1] != 1:
+            raise ValueError(
+                f"fused_compute_h: r last dim must be 1, got {list(r.shape)}"
+            )
+        if list(r.shape[:-1]) != list(proj.shape[:-1]):
+            raise ValueError(
+                f"fused_compute_h: r shape {list(r.shape)} and proj shape "
+                f"{list(proj.shape)} must agree on the leading dims"
+            )
+        if bias.shape != [P]:
+            raise ValueError(
+                f"fused_compute_h: bias must be [{P}], got {list(bias.shape)}"
+            )
         return FusedComputeH.apply(
             proj, r, alpha_pre, alpha_post, alpha_res, bias, n, eps
         )
