@@ -787,7 +787,9 @@ class MultiTokenPredictionLayer(FleetLayer):
             # Save backbone output for downstream GPTMainLMHead (main logits computation)
             dict_args["_backbone_hidden_states"] = hidden_states
             mtp_input_embeds = dict_args.get("mtp_input_embeds", None)
-            mtp_decoder_inputs = dict_args.get("mtp_decoder_inputs", None)
+            # Consumed by this layer only: pop it so it does not ride along in
+            # the **kwargs passthrough of _proj_and_transformer_layer.
+            mtp_decoder_inputs = dict_args.pop("mtp_decoder_inputs", None)
             if self.config.enable_mtp_magic_send and mtp_input_embeds is None:
                 raise RuntimeError(
                     "enable_mtp_magic_send=True but mtp_input_embeds not found in dict_args. "
