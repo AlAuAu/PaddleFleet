@@ -814,7 +814,8 @@ class MultiTokenPredictionLayer(FleetLayer):
         if self.config.enable_mtp_magic_send or self.config.separate_mtp_input:
             prev = dict_args["hidden_states"]
             mhc_multistream = dict_args.pop("mhc_multistream", None)
-            # Popped, not read: _proj_and_transformer_layer does not accept it.
+            # Consumed by this layer only: pop it so it does not ride along in
+            # the **kwargs passthrough of _proj_and_transformer_layer.
             mtp_decoder_inputs = dict_args.pop("mtp_decoder_inputs", None)
             if self.config.separate_mtp_input and mtp_decoder_inputs is None:
                 raise RuntimeError(
