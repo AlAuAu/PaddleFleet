@@ -331,9 +331,7 @@ class TestSeparateMTPInputConfig(unittest.TestCase):
 
     def test_rejects_multiple_mtp_layers(self):
         # ValueError, not assert: must survive ``python -O``.
-        with self.assertRaisesRegex(
-            ValueError, "num_nextn_predict_layers=2"
-        ):
+        with self.assertRaisesRegex(ValueError, "num_nextn_predict_layers=2"):
             TransformerConfig(
                 separate_mtp_input=True,
                 num_nextn_predict_layers=2,
@@ -395,9 +393,7 @@ class TestGPTEmbeddingSeparateOutput(unittest.TestCase):
     def test_hidden_states_carries_backbone_only(self):
         main_len = self.S - 1
         out = _run_emb(_cfg(), self._input_ids())
-        self.assertEqual(
-            out["hidden_states"].shape, [self.B, main_len, self.H]
-        )
+        self.assertEqual(out["hidden_states"].shape, [self.B, main_len, self.H])
         self.assertIn("mtp_decoder_inputs", out)
         self.assertEqual(
             out["mtp_decoder_inputs"].shape, [1, self.B, main_len, self.H]
@@ -517,9 +513,7 @@ class TestMTPLayerSeparateForward(unittest.TestCase):
         backbone = args["hidden_states"]
         marker = paddle.full([self.B, self.S, self.H], 7.0)
 
-        with _mtp_forward_ctx(
-            proj_override=lambda **kw: marker, layer=layer
-        ):
+        with _mtp_forward_ctx(proj_override=lambda **kw: marker, layer=layer):
             result = layer.forward(args)
 
         halves = paddle.split(result["hidden_states"], 2)
@@ -610,9 +604,7 @@ class TestMTPLayerNoDoubleScatter(unittest.TestCase):
         sp_spy, cp_spy = self._scatter_spies()
         args = {
             "hidden_states": paddle.randn([self.B, self.S, self.H]),
-            "mtp_input_embeds": paddle.randn(
-                [self.B, self.S * 4 + 1, self.H]
-            ),
+            "mtp_input_embeds": paddle.randn([self.B, self.S * 4 + 1, self.H]),
             "labels": paddle.randint(0, 100, [self.B, self.S]),
         }
         with _mtp_forward_ctx(
@@ -727,9 +719,7 @@ class TestHySparseLayerMTPSplit(unittest.TestCase):
             self, dict_args["hidden_states"], chunks[0], "main chunk"
         )
         self.assertEqual(len(ctx["mtp_input"]), 1)
-        _assert_bitwise_equal(
-            self, ctx["mtp_input"][0], chunks[1], "mtp chunk"
-        )
+        _assert_bitwise_equal(self, ctx["mtp_input"][0], chunks[1], "mtp chunk")
         self.assertEqual(dict_args["position_ids"].shape, [1, self.S])
         self.assertEqual(dict_args["rotary_pos_emb"].shape, [1, self.S, 32])
 
@@ -773,12 +763,12 @@ class TestWrappedPaddleNormPipeSeparate(unittest.TestCase):
         )
 
     def test_matches_magic_send_behaviour(self):
-        common = dict(
-            num_nextn_predict_layers=1,
-            hidden_size=64,
-            normalization="RMSNorm",
-            tensor_model_parallel_size=1,
-        )
+        common = {
+            "num_nextn_predict_layers": 1,
+            "hidden_size": 64,
+            "normalization": "RMSNorm",
+            "tensor_model_parallel_size": 1,
+        }
         hidden_states = paddle.randn([2, 4, 64])
         sep = self._norm_out(
             TransformerConfig(
@@ -893,9 +883,7 @@ class TestHyperConnectionContractSeparate(unittest.TestCase):
         magic.hc_head_scale.set_value(sep.hc_head_scale)
 
         out_sep = sep.forward({"hidden_states": x.clone()})["hidden_states"]
-        out_magic = magic.forward({"hidden_states": x.clone()})[
-            "hidden_states"
-        ]
+        out_magic = magic.forward({"hidden_states": x.clone()})["hidden_states"]
         _assert_bitwise_equal(self, out_sep, out_magic, "mHC contract output")
 
     def test_baseline_splits_before_contracting(self):

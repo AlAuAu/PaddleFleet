@@ -778,10 +778,7 @@ class MultiTokenPredictionLayer(FleetLayer):
         # embeddings arrive either as mtp_input_embeds (magic_send, produced by
         # MTPEmbeddingLayer at full unscattered length) or as mtp_decoder_inputs
         # (separate_mtp_input, produced by GPTEmbedding already CP/SP-scattered).
-        if (
-            self.config.enable_mtp_magic_send
-            or self.config.separate_mtp_input
-        ):
+        if self.config.enable_mtp_magic_send or self.config.separate_mtp_input:
             hidden_states = dict_args["hidden_states"]
             mhc_multistream = dict_args.pop("mhc_multistream", None)
             # Save backbone output for downstream GPTMainLMHead (main logits computation)
@@ -842,18 +839,14 @@ class MultiTokenPredictionLayer(FleetLayer):
                     )
 
                 if self.config.sequence_parallel:
-                    batch_size, local_seq_len, hidden_size = (
-                        decoder_input.shape
-                    )
+                    batch_size, local_seq_len, hidden_size = decoder_input.shape
                     decoder_input = decoder_input.reshape(
                         [-1, decoder_input.shape[-1]]
                     )
                     decoder_input = ScatterOp.apply(decoder_input)
                     if not self.config.gpt_model_use_experimental_version:
                         decoder_input = (
-                            decoder_input.reshape(
-                                [batch_size, -1, hidden_size]
-                            )
+                            decoder_input.reshape([batch_size, -1, hidden_size])
                             .permute(1, 0, 2)
                             .contiguous()
                         )  # [S/tp, B, H]
