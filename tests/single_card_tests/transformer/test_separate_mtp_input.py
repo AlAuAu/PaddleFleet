@@ -346,8 +346,9 @@ class TestSeparateMTPInputConfig(unittest.TestCase):
         self.assertTrue(cfg.separate_mtp_input)
 
     def test_rejects_multiple_mtp_layers(self):
+        # ValueError, not assert: must survive ``python -O``.
         with self.assertRaisesRegex(
-            AssertionError, "num_nextn_predict_layers=1"
+            ValueError, "num_nextn_predict_layers=2"
         ):
             TransformerConfig(
                 separate_mtp_input=True,
@@ -357,7 +358,7 @@ class TestSeparateMTPInputConfig(unittest.TestCase):
 
     def test_rejects_pipeline_parallel(self):
         with self.assertRaisesRegex(
-            AssertionError, "pipeline_model_parallel_size == 1"
+            ValueError, "pipeline_model_parallel_size=2"
         ):
             TransformerConfig(
                 separate_mtp_input=True,
@@ -366,7 +367,7 @@ class TestSeparateMTPInputConfig(unittest.TestCase):
             )
 
     def test_mutually_exclusive_with_magic_send(self):
-        with self.assertRaisesRegex(AssertionError, "mutually exclusive"):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             TransformerConfig(
                 separate_mtp_input=True,
                 enable_mtp_magic_send=True,
@@ -375,15 +376,27 @@ class TestSeparateMTPInputConfig(unittest.TestCase):
             )
 
     def test_rejects_mtp_load_weight_only(self):
-        with self.assertRaisesRegex(
-            AssertionError, "mtp_load_weight_only"
-        ):
+        with self.assertRaisesRegex(ValueError, "mtp_load_weight_only=True"):
             TransformerConfig(
                 separate_mtp_input=True,
                 mtp_load_weight_only=True,
                 num_nextn_predict_layers=1,
                 pipeline_model_parallel_size=1,
             )
+
+    def test_validation_survives_python_O(self):
+        """The checks must not be assert-based (stripped by ``python -O``)."""
+        import inspect
+        import textwrap
+
+        source = textwrap.dedent(
+            inspect.getsource(TransformerConfig.__post_init__)
+        )
+        block = source.split("if self.separate_mtp_input:", 1)[1]
+        # stop at the next top-level statement of __post_init__ (4-space indent)
+        block = block.split("\n    if ", 1)[0]
+        self.assertNotIn("assert ", block)
+        self.assertEqual(block.count("raise ValueError"), 4)
 
 
 class TestGPTEmbeddingSeparateOutput(unittest.TestCase):

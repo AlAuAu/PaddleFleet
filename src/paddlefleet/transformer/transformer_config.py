@@ -1618,19 +1618,39 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.separate_mtp_input:
-            assert self.num_nextn_predict_layers == 1, (
-                "separate_mtp_input only supports num_nextn_predict_layers=1"
-            )
-            assert self.pipeline_model_parallel_size == 1, (
-                "separate_mtp_input requires pipeline_model_parallel_size == 1; "
-                "use enable_mtp_magic_send for pipeline_model_parallel_size > 1"
-            )
-            assert not self.enable_mtp_magic_send, (
-                "separate_mtp_input and enable_mtp_magic_send are mutually exclusive"
-            )
-            assert not self.mtp_load_weight_only, (
-                "separate_mtp_input is incompatible with mtp_load_weight_only"
-            )
+            # Raise instead of assert: with ``python -O`` assertions are stripped,
+            # and an unsupported combination would then silently enter a path that
+            # only holds for the layout below -- or crash much later inside
+            # MultiTokenPredictionLayer with a missing ``mtp_decoder_inputs``.
+            if self.num_nextn_predict_layers != 1:
+                raise ValueError(
+                    "separate_mtp_input only supports "
+                    "num_nextn_predict_layers == 1, got "
+                    f"num_nextn_predict_layers={self.num_nextn_predict_layers}. "
+                    "The MTP input is consumed once and stripped from dict_args, "
+                    "so deeper MTP layers would not receive it."
+                )
+            if self.pipeline_model_parallel_size != 1:
+                raise ValueError(
+                    "separate_mtp_input requires pipeline_model_parallel_size "
+                    "== 1, got pipeline_model_parallel_size="
+                    f"{self.pipeline_model_parallel_size}. Use "
+                    "enable_mtp_magic_send for pipeline_model_parallel_size > 1."
+                )
+            if self.enable_mtp_magic_send:
+                raise ValueError(
+                    "separate_mtp_input and enable_mtp_magic_send are mutually "
+                    "exclusive, got separate_mtp_input=True and "
+                    "enable_mtp_magic_send=True. They are two transports for the "
+                    "same tensor; pick the one matching the pipeline degree."
+                )
+            if self.mtp_load_weight_only:
+                raise ValueError(
+                    "separate_mtp_input is incompatible with "
+                    "mtp_load_weight_only=True. GPTEmbedding does not build the "
+                    "shifted MTP embeddings in that mode, so separate_mtp_input "
+                    "would silently do nothing."
+                )
 
         if self.enable_mtp_magic_send:
             assert not getattr(self, "tie_word_embeddings", False), (
