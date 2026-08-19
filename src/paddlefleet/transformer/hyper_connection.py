@@ -835,9 +835,9 @@ class HyperConnectionContractLayer(FleetLayer):
         ):
             dict_args["mhc_multistream"] = hidden_states
 
-            if self.magic_send:
-                # magic_send: hidden_states is pure backbone [B, S, n*H]
-                # Magic send: backbone processes only main sequence, no MTP chunks concatenated.
+            if self.magic_send or self.config.separate_mtp_input:
+                # magic_send / separate_mtp_input: hidden_states is pure backbone [B, S, n*H]
+                # Backbone processes only the main sequence, no MTP chunks concatenated.
                 # Simply contract the entire tensor.
                 dict_args["hidden_states"] = (
                     HyperConnectionModule.learned_output_contract(
