@@ -917,18 +917,14 @@ class MultiTokenPredictionLayer(FleetLayer):
                         decoder_input, axis=1, mode=self.config.cp_balance_mode
                     )
                 if self.config.sequence_parallel:
-                    batch_size, local_seq_len, hidden_size = (
-                        decoder_input.shape
-                    )
+                    batch_size, local_seq_len, hidden_size = decoder_input.shape
                     decoder_input = decoder_input.reshape(
                         [-1, decoder_input.shape[-1]]
                     )
                     decoder_input = ScatterOp.apply(decoder_input)
                     if not self.config.gpt_model_use_experimental_version:
                         decoder_input = (
-                            decoder_input.reshape(
-                                [batch_size, -1, hidden_size]
-                            )
+                            decoder_input.reshape([batch_size, -1, hidden_size])
                             .permute(1, 0, 2)
                             .contiguous()
                         )  # [S/tp, B, H]

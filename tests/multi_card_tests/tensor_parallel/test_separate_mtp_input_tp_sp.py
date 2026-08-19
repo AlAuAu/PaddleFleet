@@ -37,18 +37,18 @@ import unittest
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, os.path.join(_repo_root, "src"))
 
-import numpy as np  # noqa: E402
-import paddle  # noqa: E402
-import paddle.distributed as dist  # noqa: E402
-from paddle.distributed import fleet  # noqa: E402
-from paddle.distributed.fleet.meta_parallel import (  # noqa: E402
+import numpy as np
+import paddle
+import paddle.distributed as dist
+from paddle.distributed import fleet
+from paddle.distributed.fleet.meta_parallel import (
     NoPipelineParallel,
 )
 
-import paddlefleet.parallel_state as ps  # noqa: E402
-from paddlefleet.gpt_builders import gpt_builder  # noqa: E402
-from paddlefleet.models.gpt import GPTConfig  # noqa: E402
-from paddlefleet.tensor_parallel.random import (  # noqa: E402
+import paddlefleet.parallel_state as ps
+from paddlefleet.gpt_builders import gpt_builder
+from paddlefleet.models.gpt import GPTConfig
+from paddlefleet.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 
@@ -145,9 +145,7 @@ def _make_inputs():
     position_ids = (
         paddle.arange(total, dtype=paddle.int64).reshape([1, -1]).cuda()
     )
-    mask_all = paddle.ones(
-        [BATCH, NUM_MTP, SEQ], dtype=paddle.float32
-    ).cuda()
+    mask_all = paddle.ones([BATCH, NUM_MTP, SEQ], dtype=paddle.float32).cuda()
     mask_all[:, :, -2:] = 0.0
     startend_all = paddle.zeros(
         [BATCH, NUM_MTP, SEQ, 1], dtype=paddle.int32
