@@ -773,28 +773,37 @@ class MultiTokenPredictionLayer(FleetLayer):
                 "multi token prediction + sequence packing is not yet supported."
             )
 
-        # === Magic Send branch ===
-        # hidden_states is pure backbone output (not concatenated); mtp_input_embeds provided by MTPEmbeddingLayer
-        if self.config.enable_mtp_magic_send:
+        # === MTP input arrives outside hidden_states (magic_send / separate_mtp_input) ===
+        # hidden_states is pure backbone output (not concatenated). The shifted MTP
+        # embeddings arrive either as mtp_input_embeds (magic_send, produced by
+        # MTPEmbeddingLayer at full unscattered length) or as mtp_decoder_inputs
+        # (separate_mtp_input, produced by GPTEmbedding already CP/SP-scattered).
+        if self.config.enable_mtp_magic_send or self.config.separate_mtp_input:
             hidden_states = dict_args["hidden_states"]
             mhc_multistream = dict_args.pop("mhc_multistream", None)
             # Save backbone output for downstream GPTMainLMHead (main logits computation)
             dict_args["_backbone_hidden_states"] = hidden_states
             mtp_input_embeds = dict_args.get("mtp_input_embeds", None)
-            if mtp_input_embeds is None:
+            # Consumed by this layer only: pop it so it does not ride along in
+            # the **kwargs passthrough of _proj_and_transformer_layer.
+            mtp_decoder_inputs = dict_args.pop("mtp_decoder_inputs", None)
+            if self.config.enable_mtp_magic_send and mtp_input_embeds is None:
                 raise RuntimeError(
                     "enable_mtp_magic_send=True but mtp_input_embeds not found in dict_args. "
                     "MTPEmbeddingLayer may not have been executed."
                 )
+            if self.config.separate_mtp_input and mtp_decoder_inputs is None:
+                raise RuntimeError(
+                    "separate_mtp_input=True but mtp_decoder_inputs not found in "
+                    "dict_args. GPTEmbedding may not have produced the shifted MTP "
+                    "embeddings."
+                )
 
-            # mtp_input_embeds: [B, S+num_mtp, H] (full embedding of original input_ids)
-            # Extract shifted slice for current depth as decoder_input
             num_mtp = self.config.num_nextn_predict_layers
-            # Compute global main sequence length S (before CP/SP scatter).
-            # hidden_states arriving here is already CP-local and/or SP-local,
-            # so we must recover the full sequence length for correct slicing of
-            # mtp_input_embeds (which is always kept at full [B, S+num_mtp, H]).
-            cp_world_size = get_context_parallel_world_size()
+            depth = self.layer_number
+            # Main sequence length as seen from hidden_states, which is already CP-local
+            # and/or SP-local. Used to trim rotary_pos_emb/cos/sin below, and (magic_send
+            # only) scaled back up to the global length for slicing mtp_input_embeds.
             if self.config.sequence_parallel:
                 # SP format: hidden_states is [S_local/tp, B, H]
                 seq_len = (
@@ -804,39 +813,43 @@ class MultiTokenPredictionLayer(FleetLayer):
             else:
                 # Non-SP: hidden_states is [B, S_local, H]
                 seq_len = hidden_states.shape[1]
-            # Recover global seq_len if CP is active
-            if cp_world_size > 1 and self.config.experimental_dataflow:
-                seq_len = seq_len * cp_world_size
+            cp_world_size = get_context_parallel_world_size()
+            if self.config.enable_mtp_magic_send:
+                # Recover global seq_len if CP is active
+                if cp_world_size > 1 and self.config.experimental_dataflow:
+                    seq_len = seq_len * cp_world_size
 
-            # shifted embedding for depth k: mtp_input_embeds[:, (k+1):(k+1+seq_len), :]
-            depth = self.layer_number
-            decoder_input = mtp_input_embeds[
-                :, (depth + 1) : (depth + 1 + seq_len), :
-            ]
+            if self.config.separate_mtp_input:
+                # mtp_decoder_inputs: [num_mtp, ...] stacked shifted embeddings from
+                # GPTEmbedding. Each entry already carries exactly the same CP/SP layout
+                # as hidden_states, so there is nothing to slice and nothing to scatter.
+                decoder_input = mtp_decoder_inputs[depth]
+            else:
+                # shifted embedding for depth k: mtp_input_embeds[:, (k+1):(k+1+seq_len), :]
+                decoder_input = mtp_input_embeds[
+                    :, (depth + 1) : (depth + 1 + seq_len), :
+                ]
 
-            # Apply CP/SP scatter to decoder_input to match the format of hidden_states.
-            # In the non-magic-send path, GPTEmbedding applies these transforms to each
-            # shifted MTP embedding before it enters MultiTokenPredictionLayer.
-            if (
-                get_context_parallel_world_size() > 1
-                and self.config.experimental_dataflow
-            ):
-                decoder_input = ContextParallelScatterOp.apply(
-                    decoder_input, axis=1, mode=self.config.cp_balance_mode
-                )
+                # Apply CP/SP scatter to decoder_input to match the format of hidden_states.
+                # In the non-magic-send path, GPTEmbedding applies these transforms to each
+                # shifted MTP embedding before it enters MultiTokenPredictionLayer.
+                if cp_world_size > 1 and self.config.experimental_dataflow:
+                    decoder_input = ContextParallelScatterOp.apply(
+                        decoder_input, axis=1, mode=self.config.cp_balance_mode
+                    )
 
-            if self.config.sequence_parallel:
-                batch_size, local_seq_len, hidden_size = decoder_input.shape
-                decoder_input = decoder_input.reshape(
-                    [-1, decoder_input.shape[-1]]
-                )
-                decoder_input = ScatterOp.apply(decoder_input)
-                if not self.config.gpt_model_use_experimental_version:
-                    decoder_input = (
-                        decoder_input.reshape([batch_size, -1, hidden_size])
-                        .permute(1, 0, 2)
-                        .contiguous()
-                    )  # [S/tp, B, H]
+                if self.config.sequence_parallel:
+                    batch_size, local_seq_len, hidden_size = decoder_input.shape
+                    decoder_input = decoder_input.reshape(
+                        [-1, decoder_input.shape[-1]]
+                    )
+                    decoder_input = ScatterOp.apply(decoder_input)
+                    if not self.config.gpt_model_use_experimental_version:
+                        decoder_input = (
+                            decoder_input.reshape([batch_size, -1, hidden_size])
+                            .permute(1, 0, 2)
+                            .contiguous()
+                        )  # [S/tp, B, H]
 
             # Pop auxiliary data
             origin_start_row_indices = dict_args.pop(
@@ -914,9 +927,7 @@ class MultiTokenPredictionLayer(FleetLayer):
             dict_args.pop("decoder_input", None)
 
             # Concat [backbone_hidden | mtp_hidden] for unified split in downstream LM heads.
-            backbone_hs = dict_args.get(
-                "_backbone_hidden_states", hidden_states
-            )
+            backbone_hs = dict_args["_backbone_hidden_states"]
             dict_args["hidden_states"] = paddle.concat(
                 [backbone_hs, hidden_states]
             )
