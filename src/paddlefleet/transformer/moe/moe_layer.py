@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
 from paddlefleet import utils
 from paddlefleet.recompute_utils import need_recompute_in_first_n
+from paddlefleet.transformer.activations import situ
 from paddlefleet.transformer.utils import profile
 
 from .fp8_utils import fused_stack_quant_without_cache
@@ -184,6 +185,18 @@ class MoELayer(nn.Layer):
             self.fp8_dispatch and self.using_sonic_moe and self.fp8_wgrad
         )
         self.moe_expert_fusion = config.moe_expert_fusion
+        self._activation_type = "situ" if self.hidden_act == situ else "swiglu"
+        if self.hidden_act == situ and self.fp8 and self.using_sonic_moe:
+            raise ValueError(
+                "SiTU-GLU + fp8 is only supported on the DeepGEMM fp8 expert "
+                "path, not on SonicMoE; please disable fp8 or switch backend."
+            )
+        if self.hidden_act == situ and self.fp8 and self.fp8_wgrad:
+            raise ValueError(
+                "SiTU-GLU + fp8 does not support fp8 expert weight gradients "
+                "yet; please set fp8_wgrad=False so that dw1/dw2 are computed "
+                "in bf16."
+            )
         self.moe_subbatch_token_num_after_dispatch = (
             config.moe_subbatch_token_num_after_dispatch
         )
