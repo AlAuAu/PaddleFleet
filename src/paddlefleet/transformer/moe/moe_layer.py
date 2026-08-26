@@ -311,6 +311,11 @@ class MoELayer(nn.Layer):
             and paddle.device.get_device_capability()[0] < 9
         ):
             # TODO: Support Ampere architecture after upgrade deepep in paddlepaddle
+            if self.moe_token_dispatcher_type == "moonep":
+                raise ValueError(
+                    "moe_token_dispatcher_type='moonep' requires GPU "
+                    "architecture SM90 or higher."
+                )
             if self.moe_token_dispatcher_type in ("deepep", "hybridep"):
                 logger.info(
                     "deepep/hybridep in paddlepaddle does not support compute capability < 9.0, "
@@ -325,10 +330,16 @@ class MoELayer(nn.Layer):
 
         self.moe_use_fusion_node = config.moe_use_fusion_node
         if self.expert_model_parallel_size > 1:
-            if self.moe_token_dispatcher_type in ("deepep", "hybridep"):
+            if self.moe_token_dispatcher_type in (
+                "deepep",
+                "hybridep",
+                "moonep",
+            ):
                 self.use_hybrid_ep_backend = is_hybrid_ep_backend_selected(
                     self.moe_token_dispatcher_type
                 )
+                if self.moe_token_dispatcher_type == "moonep":
+                    self._validate_moonep_config()
                 if (
                     self.moe_use_fusion_node
                     and self.use_hybrid_ep_backend
@@ -397,6 +408,7 @@ class MoELayer(nn.Layer):
                 f"fp8_weight_quant_format ({self.config.fp8_weight_quant_format}) configuration currently only works in SonicMoE."
             )
 
+        self._use_grouped_mlp_expert = False
         if use_fused_weight:
             if (
                 self.moe_token_dispatcher_type == "allgather"
@@ -424,6 +436,7 @@ class MoELayer(nn.Layer):
                 )
             else:
                 # TODO: replace grouped_gemm_experts with fusion_experts
+                self._use_grouped_mlp_expert = True
                 self.grouped_gemm_experts = GroupedMLPExpert(
                     self.num_local_experts,
                     routed_expert_config,
@@ -478,7 +491,11 @@ class MoELayer(nn.Layer):
                 )
 
         if self.expert_model_parallel_size > 1:
-            if self.moe_token_dispatcher_type in ("deepep", "hybridep"):
+            if self.moe_token_dispatcher_type in (
+                "deepep",
+                "hybridep",
+                "moonep",
+            ):
                 # Set NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN automatically if not set by user.
                 if (
                     self.moe_token_dispatcher_type == "hybridep"
@@ -518,6 +535,10 @@ class MoELayer(nn.Layer):
                     is not None
                 ):
                     configure_buffer(**config.deepep_buffer_configs)
+                if self.moe_token_dispatcher_type == "moonep":
+                    self.token_dispatcher.bind_experts(
+                        self.grouped_gemm_experts
+                    )
             elif self.moe_token_dispatcher_type == "alltoall":
                 local_expert_indices = list(
                     range(
@@ -713,7 +734,21 @@ class MoELayer(nn.Layer):
         self,
         dispatched_input,
         tokens_per_expert,
+        expert_weights=None,
     ):
+        if self._use_grouped_mlp_expert:
+            outputs, _ = self.grouped_gemm_experts(
+                dispatched_input,
+                tokens_per_expert,
+                expert_weights=expert_weights,
+            )
+            return outputs
+
+        if expert_weights is not None:
+            raise ValueError(
+                "External expert weights require grouped expert storage."
+            )
+
         outputs = []
         tokens_per_expert = (
             tokens_per_expert.tolist()
@@ -825,9 +860,15 @@ class MoELayer(nn.Layer):
         hidden_states: paddle.Tensor,
     ):
         global_input_tokens, tokens_per_expert = self.permute(hidden_states)
+        runtime_weights = None
+        if self.moe_token_dispatcher_type == "moonep":
+            runtime_weights = self.token_dispatcher.runtime_expert_weights(
+                self.grouped_gemm_experts
+            )
         expert_outs = self.expert_forward(
             global_input_tokens,
             tokens_per_expert,
+            expert_weights=runtime_weights,
         )
         return self.unpermute(expert_outs)
 
@@ -908,6 +949,64 @@ class MoELayer(nn.Layer):
                     f"{self.moe_intermediate_size // 128}."
                 )
 
+    def _validate_moonep_config(self):
+        """Validate the initial BF16 grouped-MLP MoonEP integration."""
+        if not self.config.bf16:
+            raise ValueError(
+                "moe_token_dispatcher_type='moonep' requires bf16=True."
+            )
+        if not self.moe_expert_fusion:
+            raise ValueError(
+                "moe_token_dispatcher_type='moonep' requires "
+                "moe_expert_fusion=True."
+            )
+        if self.fp8 or self.fp8_dispatch or self.use_w4a8:
+            raise ValueError(
+                "moe_token_dispatcher_type='moonep' currently supports "
+                "BF16 expert compute only."
+            )
+        if self.use_ue8m0 or self.using_sonic_moe:
+            raise ValueError(
+                "moe_token_dispatcher_type='moonep' does not support "
+                "UE8M0 or SonicMoE."
+            )
+        if self.moe_deep_gemm:
+            raise ValueError(
+                "moe_token_dispatcher_type='moonep' does not yet support "
+                "moe_deep_gemm."
+            )
+        if self.config.moe_expert_capacity_factor is not None:
+            raise ValueError(
+                "moe_token_dispatcher_type='moonep' does not support token "
+                "dropping or capacity padding."
+            )
+        if self.num_experts_per_tok > 32:
+            raise ValueError(
+                "moe_token_dispatcher_type='moonep' requires "
+                "num_experts_per_tok <= 32."
+            )
+        hidden_size = (
+            self.config.moe_latent_size
+            if self.use_latent_moe
+            else self.config.hidden_size
+        )
+        if hidden_size % 128 or self.moe_intermediate_size % 128:
+            raise ValueError(
+                "moe_token_dispatcher_type='moonep' requires hidden and "
+                "intermediate dimensions to be multiples of 128."
+            )
+        if self.moe_use_fusion_node:
+            logger.info(
+                "MoonEP uses its E+B grouped-MLP path; disabling "
+                "moe_use_fusion_node."
+            )
+            self.moe_use_fusion_node = False
+        if self.moe_shared_expert_overlap:
+            logger.info(
+                "MoonEP does not support shared-expert overlap; disabling it."
+            )
+            self.moe_shared_expert_overlap = False
+
     def _project_to_latent(self, hidden_states: paddle.Tensor) -> paddle.Tensor:
         """Project hidden_states to latent space, consuming any cached
         projection from the AllGather overlap path if available.
@@ -934,7 +1033,10 @@ class MoELayer(nn.Layer):
         if self.use_latent_moe:
             hidden_states = self.fc1_latent_proj(hidden_states)
 
-        should_log_balance = framework._dygraph_tracer()._has_grad
+        should_log_balance = (
+            self.moe_token_dispatcher_type != "moonep"
+            and framework._dygraph_tracer()._has_grad
+        )
         with profile("dispatch"):
             hidden_states, _ = self.dispatch(
                 hidden_states, probs, routing_map, topk_weights, topk_indices

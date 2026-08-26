@@ -50,6 +50,14 @@ from .moe_utils import (
     unpermute,
     use_accuracy_compatible_kernel,
 )
+from .moonep import (
+    MoonEPWeightBridge,
+    get_moonep_buffer,
+    is_moonep_available,
+    moonep_combine,
+    moonep_dispatch,
+    moonep_runtime_weights,
+)
 
 HAVE_HYBRID_EP = False
 HYBRID_EP_LOAD_CACHED_KERNELS = True
@@ -81,9 +89,11 @@ def is_hybrid_ep_backend_selected(
         "alltoall",
         "deepep",
         "hybridep",
+        "moonep",
     ):
         raise ValueError(
-            "moe_token_dispatcher_type must be one of: allgather, alltoall, deepep, hybridep"
+            "moe_token_dispatcher_type must be one of: "
+            "allgather, alltoall, deepep, hybridep, moonep"
         )
     if selected_dispatcher != "hybridep":
         return False
@@ -534,6 +544,259 @@ class _HybridEPManager(_DispatchManager):
         ).unsqueeze(-1)
 
 
+class _MoonEPManager(_DispatchManager):
+    """MoonEP manager using fixed-capacity E+B expert groups."""
+
+    def __init__(
+        self,
+        group: Group,
+        router_topk: int,
+        num_experts: int,
+        num_local_experts: int,
+        moe_ep_barrier: bool = True,
+    ):
+        del moe_ep_barrier
+        if not is_moonep_available():
+            raise ImportError(
+                "moe_token_dispatcher_type=moonep but MoonEP is unavailable."
+            )
+        self.group = group
+        self.router_topk = router_topk
+        self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
+        self.token_indices = None
+        self.token_probs = None
+        self.tokens_per_expert = None
+        self.dispatched_indices = None
+        self.dispatched_probs = None
+        self.handle = None
+        self._buffer = None
+        self._buffer_signature = None
+        self._bridge = None
+        self._num_dispatched_tokens = None
+
+    def bind_experts(self, grouped_experts) -> None:
+        self._bridge = MoonEPWeightBridge(
+            group=self.group,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            weight1_shape=grouped_experts.weight1.shape,
+            weight2_shape=grouped_experts.weight2.shape,
+        )
+
+    def setup_metadata(
+        self,
+        routing_map: paddle.Tensor,
+        probs: paddle.Tensor,
+        topk_weights: paddle.Tensor | None = None,
+        topk_indices: paddle.Tensor | None = None,
+    ):
+        num_tokens = routing_map.shape[0]
+        routing_map = routing_map.reshape(
+            [num_tokens, self.num_experts]
+        ).astype("bool")
+        probs = probs.reshape([num_tokens, self.num_experts])
+        if not _try_setup_router_topk_metadata(
+            self, num_tokens, topk_weights, topk_indices
+        ):
+            self.token_probs, self.token_indices = paddle.topk(
+                probs, self.router_topk, axis=-1
+            )
+        self.token_probs = self.token_probs.astype("float32")
+        self.token_indices = self.token_indices.astype("int32")
+        padding_mask = self.token_indices < 0
+        self.token_probs = paddle.where(
+            padding_mask,
+            paddle.zeros_like(self.token_probs),
+            self.token_probs,
+        )
+        self.token_indices = paddle.where(
+            padding_mask,
+            paddle.zeros_like(self.token_indices),
+            self.token_indices,
+        )
+        self.token_indices.stop_gradient = True
+        self.tokens_per_expert = _tokens_per_expert_histogram(
+            self.token_indices, self.num_experts
+        )
+
+    def _ensure_buffer(self, hidden_states: paddle.Tensor) -> None:
+        if self._bridge is None:
+            raise RuntimeError(
+                "MoonEP grouped experts must be bound before dispatch."
+            )
+        signature = (
+            int(hidden_states.shape[0]),
+            int(hidden_states.shape[1]),
+            str(hidden_states.dtype),
+            int(self.router_topk),
+            int(self.num_experts),
+            int(self.num_local_experts),
+        )
+        if self._buffer is not None:
+            if hidden_states.dtype != paddle.bfloat16:
+                raise ValueError(
+                    "MoonEP dispatch requires BF16 hidden states, "
+                    f"got {hidden_states.dtype}."
+                )
+            if signature != self._buffer_signature:
+                raise ValueError(
+                    "MoonEP requires a fixed dispatch signature while a layer "
+                    f"buffer is live: expected {self._buffer_signature}, "
+                    f"got {signature}."
+                )
+            return
+        world_size = paddle.distributed.get_world_size(self.group)
+        rank_metadata = [None] * world_size
+        paddle.distributed.all_gather_object(
+            rank_metadata,
+            signature,
+            group=self.group,
+        )
+        if any(metadata != rank_metadata[0] for metadata in rank_metadata):
+            raise ValueError(
+                "MoonEP requires an identical dispatch signature across its "
+                f"ranks, got {rank_metadata}."
+            )
+        if hidden_states.dtype != paddle.bfloat16:
+            raise ValueError(
+                "MoonEP dispatch requires BF16 hidden states, "
+                f"got {hidden_states.dtype}."
+            )
+        self._buffer_signature = signature
+        self._buffer = get_moonep_buffer(
+            S=signature[0],
+            H=hidden_states.shape[1],
+            K=self.router_topk,
+            E=self.num_experts,
+            B=self.num_local_experts,
+            num_ep_ranks=world_size,
+            group=self.group,
+        )
+        self._bridge.attach_buffer(self._buffer)
+
+    def dispatch_overlap(
+        self,
+        hidden_states: paddle.Tensor,
+        token_indices: paddle.Tensor,
+        token_weights: paddle.Tensor,
+        fp8_dispatch: bool = False,
+        async_finish: bool = False,
+        use_ue8m0: bool = False,
+    ):
+        del (
+            hidden_states,
+            token_indices,
+            token_weights,
+            fp8_dispatch,
+            async_finish,
+            use_ue8m0,
+        )
+        raise NotImplementedError("MoonEP does not support dispatch overlap.")
+
+    def dispatch(
+        self,
+        hidden_states: paddle.Tensor,
+        fp8_dispatch: bool = False,
+        async_finish: bool = False,
+        use_ue8m0: bool = False,
+        using_sonic_moe: bool = False,
+    ):
+        if fp8_dispatch or use_ue8m0 or using_sonic_moe:
+            raise NotImplementedError(
+                "MoonEP currently supports BF16 dispatch."
+            )
+        del async_finish
+        self._ensure_buffer(hidden_states)
+        state = {}
+        (
+            dispatched_hidden,
+            self.dispatched_probs,
+            self.tokens_per_expert,
+        ) = moonep_dispatch(
+            hidden_states,
+            self.token_probs,
+            self.token_indices,
+            self.tokens_per_expert,
+            self._buffer,
+            state,
+        )
+        self.handle = state["plan"]
+        return dispatched_hidden, None
+
+    def combine(
+        self,
+        hidden_states: paddle.Tensor,
+        combine_overlap_handle: dict | None = None,
+        async_finish: bool = False,
+        use_rr_deepep_combine: bool = False,
+        fp8_dispatch: bool = False,
+        combine_grad_handle: dict | None = None,
+    ):
+        if combine_overlap_handle is not None:
+            raise NotImplementedError(
+                "MoonEP does not support shared-expert combine overlap."
+            )
+        del (
+            async_finish,
+            use_rr_deepep_combine,
+            fp8_dispatch,
+            combine_grad_handle,
+        )
+        hidden_states = moonep_combine(
+            hidden_states, self._buffer, self.handle, self._bridge
+        )
+        self.handle = None
+        self.token_indices = None
+        self.token_probs = None
+        self.tokens_per_expert = None
+        self.dispatched_probs = None
+        self._num_dispatched_tokens = None
+        return hidden_states
+
+    def runtime_expert_weights(self, grouped_experts):
+        if self.handle is None:
+            raise RuntimeError("MoonEP runtime weights require an active plan.")
+        return moonep_runtime_weights(
+            grouped_experts, self._bridge, self.handle
+        )
+
+    def get_dispatched_metadata(self):
+        raise NotImplementedError(
+            "MoonEP exposes E+B group counts instead of DeepEP routing metadata."
+        )
+
+    def get_number_of_tokens_per_expert(self):
+        return self.tokens_per_expert
+
+    def get_permuted_hidden_states_by_experts(self, hidden_states):
+        self._num_dispatched_tokens = int(hidden_states.shape[0])
+        num_valid_tokens = int(self.tokens_per_expert.sum().item())
+        return hidden_states[:num_valid_tokens]
+
+    def get_restored_hidden_states_by_experts(self, hidden_states):
+        if self.dispatched_probs is not None:
+            hidden_states = hidden_states * self.dispatched_probs[
+                : hidden_states.shape[0]
+            ].astype(hidden_states.dtype).unsqueeze(-1)
+        if hidden_states.shape[0] != self._num_dispatched_tokens:
+            hidden_states = paddle.concat(
+                [
+                    hidden_states,
+                    paddle.zeros(
+                        [
+                            self._num_dispatched_tokens
+                            - hidden_states.shape[0],
+                            hidden_states.shape[1],
+                        ],
+                        dtype=hidden_states.dtype,
+                    ),
+                ],
+                axis=0,
+            )
+        return hidden_states
+
+
 class _DeepEPManager(_DispatchManager):
     """
     A manager class to handle fused all-to-all communication processes for MoE models using
@@ -854,11 +1117,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self.use_accuracy_compatible = use_accuracy_compatible
         self.num_local_experts = num_local_experts
         assert self.ep_size > 1, "Flex token dispatcher requires EP > 1"
-        manager_cls = (
-            _HybridEPManager
-            if is_hybrid_ep_backend_selected(dispatcher_type)
-            else _DeepEPManager
-        )
+        if dispatcher_type == "moonep":
+            manager_cls = _MoonEPManager
+        elif is_hybrid_ep_backend_selected(dispatcher_type):
+            manager_cls = _HybridEPManager
+        else:
+            manager_cls = _DeepEPManager
         manager_kwargs = {
             "group": self.ep_group,
             "router_topk": num_experts_per_tok,
@@ -869,9 +1133,20 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         if manager_cls is _HybridEPManager:
             manager_kwargs["hybridep_buffer_configs"] = hybridep_buffer_configs
             manager_kwargs["moe_deep_gemm"] = moe_deep_gemm
-        else:
+        elif manager_cls is _DeepEPManager:
             manager_kwargs["use_accuracy_compatible"] = use_accuracy_compatible
         self._comm_manager = manager_cls(**manager_kwargs)
+
+    def bind_experts(self, grouped_experts) -> None:
+        if isinstance(self._comm_manager, _MoonEPManager):
+            self._comm_manager.bind_experts(grouped_experts)
+
+    def runtime_expert_weights(self, grouped_experts):
+        if not isinstance(self._comm_manager, _MoonEPManager):
+            raise RuntimeError(
+                "runtime_expert_weights is only provided by the MoonEP manager."
+            )
+        return self._comm_manager.runtime_expert_weights(grouped_experts)
 
     def dispatch_preprocess(
         self,

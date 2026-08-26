@@ -15,8 +15,10 @@
 
 import functools
 import os
+from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import dataclass
 
 import paddle
 import paddle.nn.functional as F
@@ -74,12 +76,34 @@ g_shard_bypass_dygraph_optimizer = int(
 )
 
 
+@dataclass(frozen=True)
+class RuntimeExpertWeights:
+    """Expert weights with hooks that restore mutable storage for backward."""
+
+    tensors: tuple[paddle.Tensor, paddle.Tensor]
+    restore_before_backward: tuple[
+        Callable[[], None] | None,
+        Callable[[], None] | None,
+    ] = (None, None)
+
+    def __iter__(self):
+        return iter(self.tensors)
+
+
 class BMMFunction(paddle.autograd.PyLayer):
     @staticmethod
-    def forward(ctx, x, y, batch_sizes, trans_y=False):
+    def forward(
+        ctx,
+        x,
+        y,
+        batch_sizes,
+        trans_y=False,
+        restore_weight=None,
+    ):
         ctx.save_for_backward(x, y)
         ctx.batch_sizes = batch_sizes
         ctx.trans_y = trans_y
+        ctx.restore_weight = restore_weight
         return paddle.incubate.nn.functional.batched_gemm(
             x, y, batch_sizes, trans_rhs=trans_y
         )
@@ -87,6 +111,10 @@ class BMMFunction(paddle.autograd.PyLayer):
     @staticmethod
     def backward(ctx, grad):
         x, y = ctx.saved_tensor()
+        if ctx.restore_weight is not None:
+            # Restore and consume the weight in one autograd node so another
+            # microbatch cannot replace MoonEP's redundant slots in between.
+            ctx.restore_weight()
         batch_sizes = ctx.batch_sizes
         trans_y = ctx.trans_y
 
@@ -347,8 +375,22 @@ class GroupedMLPExpert(FleetLayer):
         self,
         permuted_local_hidden_states: paddle.Tensor,
         tokens_per_expert: paddle.Tensor,
+        expert_weights: (
+            RuntimeExpertWeights | tuple[paddle.Tensor, paddle.Tensor] | None
+        ) = None,
     ):
         """Forward step of the GroupedMLP without TP/DP."""
+
+        restore_weight1 = restore_weight2 = None
+        if isinstance(expert_weights, RuntimeExpertWeights):
+            weight1, weight2 = expert_weights.tensors
+            restore_weight1, restore_weight2 = (
+                expert_weights.restore_before_backward
+            )
+        elif expert_weights is not None:
+            weight1, weight2 = expert_weights
+        else:
+            weight1, weight2 = self.weight1, self.weight2
 
         if permuted_local_hidden_states.numel() != 0:
             tokens_per_expert = tokens_per_expert.cpu().tolist()
@@ -357,14 +399,16 @@ class GroupedMLPExpert(FleetLayer):
             if self.moe_deep_gemm:
                 fc1_output = DeepGEMMBMMFunction.apply(
                     permuted_local_hidden_states,
-                    self.weight1,
+                    weight1,
                     paddle.to_tensor(tokens_per_expert, dtype="int32"),
                 )
             else:
                 fc1_output = BMMFunction.apply(
                     permuted_local_hidden_states,
-                    self.weight1,
+                    weight1,
                     tokens_per_expert,
+                    False,
+                    restore_weight1,
                 )
             if self.activation_recompute:
                 raise NotImplementedError(
@@ -375,20 +419,24 @@ class GroupedMLPExpert(FleetLayer):
                 if self.moe_deep_gemm:
                     fc2_output = DeepGEMMBMMFunction.apply(
                         intermediate_parallel,
-                        self.weight2,
+                        weight2,
                         paddle.to_tensor(tokens_per_expert, dtype="int32"),
                     )
                 else:
                     fc2_output = BMMFunction.apply(
-                        intermediate_parallel, self.weight2, tokens_per_expert
+                        intermediate_parallel,
+                        weight2,
+                        tokens_per_expert,
+                        False,
+                        restore_weight2,
                     )
         else:
             # No token is allocated for local experts.
             assert paddle.count_nonzero(tokens_per_expert) == 0
 
             # Make sure params of experts still have gradients even given zero tokens.
-            w1 = self.weight1.reshape(self.config.hidden_size, -1)
-            w2 = self.weight2.reshape(-1, self.config.hidden_size)
+            w1 = weight1.reshape(weight1.shape[1], -1)
+            w2 = weight2.reshape(-1, weight2.shape[2])
             h = paddle.matmul(permuted_local_hidden_states, w1)
             if self.activation_recompute:
                 raise NotImplementedError(
