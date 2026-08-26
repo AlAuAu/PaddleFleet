@@ -111,25 +111,27 @@ def _validate_dsv4_boundary_values(
             )
 
 
-def _pack_dsv4_logical_batch(
-    hidden_states: Tensor,
+def pack_dsv4_docmask(
     startend_row_indices: Tensor | None,
+    batch_size: int,
+    seqlen: int,
     *,
     cp_size: int,
     dense_mode: bool,
     max_sequence_length: int | None = None,
-) -> tuple[Tensor, Tensor | None, int, int]:
-    """Pack a logical batch into the single-sequence DSV4 representation."""
-    if len(hidden_states.shape) != 3:
-        raise ValueError(
-            "DSv4HybridAttention expects rank-3 hidden_states [B, S, H], "
-            f"got shape {hidden_states.shape}"
-        )
+) -> Tensor:
+    """Rebase a ``[b, 1, s, 1]`` document mask onto the packed ``[1, 1, b*s, 1]``.
 
-    batch_size, seqlen, _ = hidden_states.shape
-    if batch_size <= 1:
-        return hidden_states, startend_row_indices, batch_size, seqlen
+    The mask half of ``_pack_dsv4_logical_batch``, guards included, factored out
+    because the ``csa_share_docmask_meta`` prebuild has to produce exactly the
+    layout the layers will look up. A second copy of the offset arithmetic there
+    would be invisible to the registry's consistency check, which compares
+    ``(ratio, batch_size, seqlen)`` only: a drifted offset rule keeps every shape
+    right and silently serves the wrong document boundaries.
 
+    ``batch_size > 1`` is the caller's precondition -- at 1 there is nothing to
+    rebase and the mask is already in its packed form.
+    """
     if not dense_mode:
         raise NotImplementedError(
             "DSv4HybridAttention only supports batch_size > 1 in dense mode; "
@@ -179,6 +181,36 @@ def _pack_dsv4_logical_batch(
         startend_row_indices,
         batch_size * seqlen,
         "packed",
+    )
+    return startend_row_indices
+
+
+def _pack_dsv4_logical_batch(
+    hidden_states: Tensor,
+    startend_row_indices: Tensor | None,
+    *,
+    cp_size: int,
+    dense_mode: bool,
+    max_sequence_length: int | None = None,
+) -> tuple[Tensor, Tensor | None, int, int]:
+    """Pack a logical batch into the single-sequence DSV4 representation."""
+    if len(hidden_states.shape) != 3:
+        raise ValueError(
+            "DSv4HybridAttention expects rank-3 hidden_states [B, S, H], "
+            f"got shape {hidden_states.shape}"
+        )
+
+    batch_size, seqlen, _ = hidden_states.shape
+    if batch_size <= 1:
+        return hidden_states, startend_row_indices, batch_size, seqlen
+
+    startend_row_indices = pack_dsv4_docmask(
+        startend_row_indices,
+        batch_size,
+        seqlen,
+        cp_size=cp_size,
+        dense_mode=dense_mode,
+        max_sequence_length=max_sequence_length,
     )
 
     hidden_states = hidden_states.reshape([1, batch_size * seqlen, -1])
