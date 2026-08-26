@@ -41,6 +41,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .io_writers import JsonWriter, YamlWriter
+from .layer_fields import StaleMtpKeyError, reject_stale_mtp_key
 from .model_config_resolver import (
     ModelConfigResolveError,
     build_adapted_dir,
@@ -183,6 +184,18 @@ class ConfigAdapter:
             )
 
         self._apply_auto_overrides(config, model_config, log)
+
+        # TransformerConfig rejects a non-zero `mtp_num_layers` outright, so a
+        # config that still carries one cannot start training. Check *after*
+        # every override has been applied: `--set json:mtp_num_layers=2` (and the
+        # prefix-less form routed by `_apply_auto_overrides`) would otherwise
+        # re-insert the key past an earlier check, and the raise that
+        # `effective_mtp_layers` performs during PP planning escapes as a
+        # traceback rather than a clean `(False, message)`.
+        try:
+            reject_stale_mtp_key(model_config)
+        except StaleMtpKeyError as exc:
+            return False, f"{input_path.name}: {exc}"
 
         plan, err = plan_parallelism(
             config,

@@ -63,9 +63,6 @@ class TransformerConfig(ModelParallelConfig):
     mtp_distillation_loss: bool = False
     """Whether to use distillation MTP loss."""
 
-    mtp_num_layers: int = 0
-    """MTP Layer number."""
-
     mtp_loss_scaling_factor: float = 0.1
     """Weighting factor of Multi-Token Prediction (MTP) loss."""
 
@@ -1338,7 +1335,7 @@ class TransformerConfig(ModelParallelConfig):
 
     csa_compress_ratios: list | None = None
     """Per-layer attention-kind assignment for the DSv4 hybrid attention stack.
-    Length must equal num_hidden_layers (+ mtp_num_layers if present).
+    Length must equal num_hidden_layers (+ num_nextn_predict_layers if present).
     Each entry encodes the layer kind via its integer ratio value:
       - -2: MLA layer — multi-head latent attention. How it actually runs is
         chosen by ``hybrid_mla_attention`` (``"mha"`` / ``"mqa_dsa"`` /
@@ -1622,6 +1619,29 @@ class TransformerConfig(ModelParallelConfig):
         "csa_indexer_init_from_scratch": "Use indexer_init_from_scratch instead.",
     }
 
+    # Same intent as ``renamed_config_keys``, but only rejected when the stale
+    # key carries a value that would change behaviour. A falsy value means the
+    # feature is off in both spellings, so nothing is lost by absorbing it.
+    #
+    # ``mtp_num_layers`` needs this weaker form because PaddleFormers still owns
+    # a field of that name: ``LlmMetaConfig.mtp_attributes`` and
+    # ``TrainingArguments`` both declare it (default 0), so *every* PaddleFormers
+    # config hands it to ``register_attributes`` whether or not MTP is used.
+    # Rejecting it outright would make every Fleet-provider model in that repo
+    # fail to build. Its ">1 means autoregressive MTP" semantics there also mean
+    # ``sft/workflow.py`` swaps the value into ``num_nextn_predict_layers``
+    # before the provider is constructed, so a legitimate MTP run arrives here
+    # with ``mtp_num_layers == 0`` already.
+    renamed_config_keys_when_set = {
+        "mtp_num_layers": (
+            "Use num_nextn_predict_layers instead: it is the only field every "
+            "MTP consumer reads (GPTEmbedding's K+1 embedding chunks, the MTP "
+            "forward's hidden_states split, LanguageLoss's per-depth labels). "
+            "Set num_nextn_predict_layers to the value mtp_num_layers used to "
+            "carry, and drop mtp_num_layers."
+        ),
+    }
+
     @classmethod
     def from_config(cls, config_dict):
         # note(zhangweilong): if cls(),will call __post_init__ directly,but __new__ will skip some attr init .please check provider attr
@@ -1672,6 +1692,13 @@ class TransformerConfig(ModelParallelConfig):
                 f"{key} was renamed and is no longer supported. "
                 f"{self.renamed_config_keys[key]} Update the config that still "
                 f"sets {key}; it would otherwise be silently ignored."
+            )
+        elif key in self.renamed_config_keys_when_set and value:
+            raise ValueError(
+                f"{key} was renamed and is no longer supported. "
+                f"{self.renamed_config_keys_when_set[key]} Update the config "
+                f"that still sets {key}={value!r}; it would otherwise be "
+                f"silently ignored."
             )
         else:
             setattr(self, key, value)
@@ -1771,23 +1798,8 @@ class TransformerConfig(ModelParallelConfig):
                     "enable_mtp_magic_send with vpp requires variable_seq_lengths=True"
                 )
 
-        if self.use_erndata and (
-            self.num_nextn_predict_layers > 0 or self.mtp_num_layers > 0
-        ):
+        if self.use_erndata and self.num_nextn_predict_layers > 0:
             # erndata + MTP selects the packed-doc (MCore 8c4df6b07) contract.
-            # K is read from `num_nextn_predict_layers` by every runtime
-            # consumer of that path (GPTEmbedding builds the K+1 embedding
-            # chunks from it, `_forward_megatron_style` splits hidden_states
-            # into K+1 chunks with it). The `mtp_num_layers` alias is only
-            # honored by MTP *layer construction* (`_get_effective_mtp_layers`),
-            # so configuring K through the alias alone would build MTP layers
-            # that the data path never feeds.
-            if self.num_nextn_predict_layers <= 0:
-                raise ValueError(
-                    "use_erndata=True with MTP requires "
-                    "num_nextn_predict_layers > 0; the `mtp_num_layers` alias "
-                    "is not honored by the erndata MTP data path."
-                )
             if self.enable_mtp_magic_send:
                 raise ValueError(
                     "use_erndata=True with MTP is incompatible with "
@@ -2189,26 +2201,14 @@ class TransformerConfig(ModelParallelConfig):
                     "experimental_attention_variant='dsv4_hybrid' requires "
                     "csa_compress_ratios to be set."
                 )
-            mtp_num_layers = (
-                self.mtp_num_layers or self.num_nextn_predict_layers
-            )
-            if (
-                self.mtp_num_layers > 0
-                and self.num_nextn_predict_layers > 0
-                and self.mtp_num_layers != self.num_nextn_predict_layers
-            ):
-                raise ValueError(
-                    "mtp_num_layers and num_nextn_predict_layers must be equal when "
-                    f"both are positive, got {self.mtp_num_layers} and "
-                    f"{self.num_nextn_predict_layers}"
-                )
             if (
                 len(self.csa_compress_ratios)
-                != self.num_hidden_layers + mtp_num_layers
+                != self.num_hidden_layers + self.num_nextn_predict_layers
             ):
                 raise ValueError(
                     f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) "
-                    f"must equal num_hidden_layers ({self.num_hidden_layers + mtp_num_layers})."
+                    f"must equal num_hidden_layers "
+                    f"({self.num_hidden_layers + self.num_nextn_predict_layers})."
                 )
             for i, r in enumerate(self.csa_compress_ratios):
                 # Accept python int and numpy integer scalars (a ratios list
@@ -2785,10 +2785,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.separate_mtp_headloss:
             import warnings as _warnings
 
-            # Resolve the effective number of MTP layers, following the same
-            # logic used elsewhere in __post_init__ (see the csa branch above).
-            mtp_num_layers = self.num_nextn_predict_layers
-            mtp_enabled = mtp_num_layers > 0
+            mtp_layers = self.num_nextn_predict_layers
+            mtp_enabled = mtp_layers > 0
             pp_enabled = self.pipeline_model_parallel_size > 1
 
             # 1. separate_mtp_headloss is only meaningful when both MTP and PP
@@ -2797,7 +2795,7 @@ class TransformerConfig(ModelParallelConfig):
                 _warnings.warn(
                     "separate_mtp_headloss=True requires both MTP and pipeline "
                     "parallel to be enabled "
-                    f"(mtp_num_layers={mtp_num_layers}, "
+                    f"(num_nextn_predict_layers={mtp_layers}, "
                     f"pipeline_model_parallel_size={self.pipeline_model_parallel_size}). "
                     "Forcing separate_mtp_headloss=False."
                 )
@@ -2837,14 +2835,14 @@ class TransformerConfig(ModelParallelConfig):
                     0, self.num_empty_layers_add_in_tail - 1
                 )
                 total_layers = (
-                    self.num_hidden_layers + mtp_num_layers + num_empty_layers
+                    self.num_hidden_layers + mtp_layers + num_empty_layers
                 )
                 denom = pp_degree * vpp_degree
                 if total_layers % denom != 0 or total_layers // denom != 1:
                     _warnings.warn(
                         "separate_mtp_headloss=True requires "
                         "(num_hidden_layers + num_mtp_layers + num_empty_layers) "
-                        f"({self.num_hidden_layers} + {mtp_num_layers} + "
+                        f"({self.num_hidden_layers} + {mtp_layers} + "
                         f"{num_empty_layers} = {total_layers}) to be divisible "
                         f"by pp_degree*vpp_degree ({pp_degree}*{vpp_degree} = "
                         f"{denom}) and the quotient to equal 1 (exactly one "

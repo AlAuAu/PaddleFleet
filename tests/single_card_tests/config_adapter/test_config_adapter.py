@@ -57,8 +57,10 @@ from paddlefleet.config_adapter.io_writers import (
     detect_map_indent,
 )
 from paddlefleet.config_adapter.layer_fields import (
+    StaleMtpKeyError,
     effective_mtp_layers,
     plan_layer_field_shrink,
+    reject_stale_mtp_key,
 )
 from paddlefleet.config_adapter.model_config_resolver import (
     ModelConfigResolveError,
@@ -914,19 +916,38 @@ class TestLayerFieldPlanning(unittest.TestCase):
             **overrides,
         }
 
-    def test_effective_mtp_follows_the_framework_rule(self):
-        # mtp_num_layers wins whenever it is non-zero.
-        self.assertEqual(
-            effective_mtp_layers(
-                {"mtp_num_layers": 2, "num_nextn_predict_layers": 0}
-            ),
-            2,
-        )
+    def test_effective_mtp_reads_num_nextn_predict_layers(self):
+        # num_nextn_predict_layers is the only key; the historical
+        # mtp_num_layers alias was removed from TransformerConfig.
         self.assertEqual(
             effective_mtp_layers({"num_nextn_predict_layers": 3}), 3
         )
         self.assertEqual(effective_mtp_layers({}), 0)
         self.assertEqual(effective_mtp_layers(None), 0)
+
+    def test_reject_stale_mtp_key_accepts_missing_config(self):
+        reject_stale_mtp_key(None)
+
+    def test_effective_mtp_rejects_the_stale_key(self):
+        # TransformerConfig refuses a non-zero `mtp_num_layers`, so a JSON that
+        # still sets one cannot start training. Fail here rather than silently
+        # reading K=0 and handing back a config the framework will reject.
+        with self.assertRaises(StaleMtpKeyError) as ctx:
+            effective_mtp_layers(
+                {"num_nextn_predict_layers": 0, "mtp_num_layers": 2}
+            )
+        self.assertIn("num_nextn_predict_layers", str(ctx.exception))
+
+    def test_effective_mtp_tolerates_a_zero_stale_key(self):
+        # `mtp_num_layers: 0` means "MTP off", exactly what the key's absence
+        # means, and PaddleFormers stamps that default onto every config it
+        # produces. The framework accepts it, so the adapter must too.
+        self.assertEqual(
+            effective_mtp_layers(
+                {"num_nextn_predict_layers": 3, "mtp_num_layers": 0}
+            ),
+            3,
+        )
 
     def test_truncates_layer_part_and_keeps_the_mtp_tail(self):
         changes, err = plan_layer_field_shrink(self._config(), 64, 16, 1)
@@ -1637,15 +1658,13 @@ class TestLayerFields(ConfigAdapterTestBase):
         self.assertTrue(ok, message)
         self.assertEqual(self.load_output_json(8)["window_attn_skip_freq"], 4)
 
-    def test_mtp_num_layers_alias_wins_over_a_zero(self):
-        # The framework resolves the MTP count as
-        # `mtp_num_layers or num_nextn_predict_layers`, so a zero in the
-        # second key must not hide a valid value in the first.
+    def test_mtp_count_comes_from_num_nextn_predict_layers(self):
+        # The removed mtp_num_layers alias must not contribute to the layer
+        # count: only num_nextn_predict_layers does.
         self.write_json(
             {
                 **MODEL_CONFIG,
-                "num_nextn_predict_layers": 0,
-                "mtp_num_layers": 2,
+                "num_nextn_predict_layers": 2,
                 "csa_compress_ratios": [128, 128, 128, -2] * 16 + [-2, -2],
                 "layer_types": ["full_attention"] * 64,
             }
@@ -1657,6 +1676,76 @@ class TestLayerFields(ConfigAdapterTestBase):
         # 32 layers + the 2 MTP entries.
         self.assertEqual(len(model_config["csa_compress_ratios"]), 34)
         self.assertEqual(len(model_config["layer_types"]), 32)
+
+    def test_stale_mtp_key_aborts_the_whole_adaptation(self):
+        # End-to-end: a JSON that still carries a non-zero `mtp_num_layers` must
+        # make `adapt` fail with a migration hint instead of rewriting the
+        # config. TransformerConfig would refuse such a JSON anyway, so producing
+        # an adapted copy of it is worse than useless.
+        self.write_json(
+            {**MODEL_CONFIG, "num_nextn_predict_layers": 0, "mtp_num_layers": 2}
+        )
+        ok, message = self.adapt(target_nodes=1)
+        self.assertFalse(ok)
+        self.assertIn("mtp_num_layers", message)
+        self.assertIn("num_nextn_predict_layers", message)
+
+    def test_zero_stale_mtp_key_is_adapted_normally(self):
+        # `mtp_num_layers: 0` is what PaddleFormers stamps onto every config it
+        # produces and what the framework accepts, so it must not abort the
+        # adaptation.
+        self.write_json(
+            {
+                **MODEL_CONFIG,
+                "num_nextn_predict_layers": 2,
+                "mtp_num_layers": 0,
+                "csa_compress_ratios": [128, 128, 128, -2] * 16 + [-2, -2],
+                "layer_types": ["full_attention"] * 64,
+            }
+        )
+        ok, message = self.adapt(target_nodes=1)
+        self.assertTrue(ok, message)
+        model_config = self.load_output_json(8)
+        self.assertEqual(model_config["num_hidden_layers"], 32)
+        self.assertEqual(len(model_config["csa_compress_ratios"]), 34)
+
+    def test_stale_mtp_key_via_json_override_is_refused(self):
+        # `--set json:mtp_num_layers=...` re-inserts the key into an otherwise
+        # clean JSON, so the check has to run *after* the overrides are applied.
+        # Otherwise the adapted config would carry a key TransformerConfig
+        # rejects, and the raise inside effective_mtp_layers would surface as a
+        # traceback during PP planning rather than a clean (False, message).
+        self.write_json(dict(MODEL_CONFIG))
+        ok, message = self.adapt(
+            target_nodes=1, json_overrides={"mtp_num_layers": 2}
+        )
+        self.assertFalse(ok)
+        self.assertIn("mtp_num_layers", message)
+        self.assertIn("num_nextn_predict_layers", message)
+        # Nothing may be emitted: the source JSON is clean, so a
+        # rewritten copy would be the only place the key could appear.
+        self.assertFalse(
+            (
+                self.output_dir
+                / "model_config_separated"
+                / "model_dir_adapted_8cards"
+                / "model_config.json"
+            ).exists(),
+            "no adapted model_config.json may be written",
+        )
+
+    def test_stale_mtp_key_via_auto_override_is_refused(self):
+        # The prefix-less `--set mtp_num_layers=...` form is routed to the JSON
+        # by _apply_auto_overrides when the key is present there, which is a
+        # second way past a check placed before the overrides.
+        self.write_json(
+            {**MODEL_CONFIG, "num_nextn_predict_layers": 0, "mtp_num_layers": 0}
+        )
+        ok, message = self.adapt(
+            target_nodes=1, auto_overrides={"mtp_num_layers": 2}
+        )
+        self.assertFalse(ok)
+        self.assertIn("mtp_num_layers", message)
 
 
 class TestFailureLeavesSourcesUntouched(ConfigAdapterTestBase):

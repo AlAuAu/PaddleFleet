@@ -56,20 +56,47 @@ LAYER_FIELDS = (
 )
 
 
+class StaleMtpKeyError(ValueError):
+    """A ``model_config.json`` still carries the removed ``mtp_num_layers``."""
+
+
+def reject_stale_mtp_key(model_config):
+    """Fail loudly when a *meaningful* ``mtp_num_layers`` is still present.
+
+    ``TransformerConfig`` rejects the key via ``renamed_config_keys_when_set``
+    whenever it is non-zero, so a JSON that still carries a real value cannot
+    start training. The adapter reads the same JSON and would otherwise happily
+    rewrite it while silently treating K as 0 -- handing back a config the
+    framework then refuses. Surface it here instead.
+
+    ``mtp_num_layers: 0`` is tolerated for the same reason the framework
+    tolerates it: it means "MTP off", which is exactly what the key's absence
+    means, and PaddleFormers stamps that default onto every config it produces.
+    """
+    if model_config is None:
+        return
+    if not model_config.get("mtp_num_layers"):
+        return
+    raise StaleMtpKeyError(
+        "model_config.json still sets the removed `mtp_num_layers` "
+        f"(={model_config.get('mtp_num_layers')!r}). Use "
+        "`num_nextn_predict_layers` instead: it is the only field the MTP "
+        "consumers read. TransformerConfig rejects a non-zero "
+        "`mtp_num_layers` outright, so this config cannot start training "
+        "until the key is migrated."
+    )
+
+
 def effective_mtp_layers(model_config):
     """MTP layer count the framework actually uses.
 
-    ``TransformerConfig`` resolves it as ``mtp_num_layers or
-    num_nextn_predict_layers``, i.e. ``mtp_num_layers`` wins whenever it is
-    non-zero.  A plain "first alias that is not None" lookup would read
-    ``num_nextn_predict_layers: 0`` and miss a valid ``mtp_num_layers: 2``,
-    which then makes every per-layer list look inconsistent.
+    ``num_nextn_predict_layers`` is the single source of truth; the historical
+    ``mtp_num_layers`` alias has been removed from ``TransformerConfig``.
     """
     if model_config is None:
         return 0
-    primary = int(model_config.get("mtp_num_layers") or 0)
-    fallback = int(model_config.get("num_nextn_predict_layers") or 0)
-    return primary or fallback
+    reject_stale_mtp_key(model_config)
+    return int(model_config.get("num_nextn_predict_layers") or 0)
 
 
 def _csa_family(ratio):
