@@ -646,7 +646,7 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_token_dispatcher_type: str = "alltoall"
     """The type of token dispatcher to use. The default is 'alltoall'.
-    Options are 'allgather', 'alltoall', 'deepep', 'hybridep', and 'moonep'.
+    Options are 'allgather', 'alltoall', 'deepep', 'hybridep', 'ringmoe', and 'moonep'.
     Call ``paddlefleet.transformer.moe.finalize_moonep`` before destroying
     the process group when using MoonEP."""
 

@@ -62,6 +62,7 @@ from .token_dispatcher import (
     AllGatherTokenDispatcher,
     AllToAllTokenDispatcher,
     MoEFlexTokenDispatcher,
+    RingMoETokenDispatcher,
     is_hybrid_ep_backend_selected,
 )
 
@@ -193,6 +194,19 @@ class MoELayer(nn.Layer):
         self.sequence_parallel = config.sequence_parallel
         self.tensor_model_parallel_size = config.tensor_model_parallel_size
         self.moe_token_dispatcher_type = config.moe_token_dispatcher_type
+        # 'allgather' and 'ringmoe' are independent dispatchers sharing one
+        # expert layout: every rank holds all experts, each sharded along its
+        # intermediate dim (I // EP). Expert construction, config validation,
+        # num_experts_per_device and the checkpoint shard declarations key off
+        # that layout, not the dispatcher identity. Mirrors
+        # GroupedMLPExpert.intermediate_ep_sharded; keep the two in sync.
+        # moe_token_dispatcher_type itself is never rewritten, so every layer
+        # and checkpoint-layout decision still sees what was configured.
+        self.use_ring_moe = self.moe_token_dispatcher_type == "ringmoe"
+        self.use_intermediate_ep_sharding = self.moe_token_dispatcher_type in (
+            "allgather",
+            "ringmoe",
+        )
         self.moe_allgather_gate_overlap = config.moe_allgather_gate_overlap
         self.use_hybrid_ep_backend = False
         self.moe_shared_expert_overlap = config.moe_shared_expert_overlap
@@ -352,8 +366,8 @@ class MoELayer(nn.Layer):
                         "HybridEP backend does not support moe_shared_expert_overlap; disabling it."
                     )
                     self.moe_shared_expert_overlap = False
-            elif self.moe_token_dispatcher_type == "allgather":
-                self._validate_allgather_config()
+            elif self.use_intermediate_ep_sharding:
+                self._validate_intermediate_ep_sharding_config()
             else:
                 logger.info(
                     "moe_use_fusion_node is only supported when moe_token_dispatcher_type is 'deepep' or 'hybridep'; disabling it."
@@ -414,11 +428,11 @@ class MoELayer(nn.Layer):
         self._use_grouped_mlp_expert = False
         if use_fused_weight:
             if (
-                self.moe_token_dispatcher_type == "allgather"
+                self.use_intermediate_ep_sharding
                 and self.expert_model_parallel_size > 1
             ):
-                # AllGather EP>1: every rank holds all experts, sharded
-                # along intermediate dim (I // EP per rank).
+                # Intermediate-EP sharding with EP>1: every rank holds all
+                # experts, sharded along intermediate dim (I // EP per rank).
                 self.grouped_gemm_experts = SonicMoEExpert(
                     self.num_experts,
                     self.num_experts_per_tok,
@@ -558,8 +572,13 @@ class MoELayer(nn.Layer):
                         self, "use_accuracy_compatible", False
                     ),
                 )
-            elif self.moe_token_dispatcher_type == "allgather":
-                self.token_dispatcher = AllGatherTokenDispatcher(
+            elif self.use_intermediate_ep_sharding:
+                dispatcher_cls = (
+                    RingMoETokenDispatcher
+                    if self.use_ring_moe
+                    else AllGatherTokenDispatcher
+                )
+                self.token_dispatcher = dispatcher_cls(
                     self.moe_group,
                     self.expert_model_parallel_size,
                     self.num_experts,
@@ -744,8 +763,9 @@ class MoELayer(nn.Layer):
             self.moe_grad_group = self.pg_collection.expt_dp
             self.moe_rank = utils.get_pg_rank(self.moe_group)
             self.moe_rank = max(self.moe_rank, 0)
-            if self.moe_token_dispatcher_type == "allgather":
-                # AllGather: every rank holds a shard of every expert.
+            if self.use_intermediate_ep_sharding:
+                # Intermediate-EP sharding: every rank holds a shard of every
+                # expert.
                 self.num_experts_per_device = self.num_experts
             else:
                 self.num_experts_per_device = _parse_moe_expert_parallel(
@@ -866,7 +886,11 @@ class MoELayer(nn.Layer):
         ``_comm_manager.combine`` directly, which already returns the restored
         tensor (no separate combine_postprocess step).
         """
-        if self.moe_token_dispatcher_type in ("allgather", "alltoall"):
+        if self.moe_token_dispatcher_type in (
+            "allgather",
+            "ringmoe",
+            "alltoall",
+        ):
             hidden_states = self.token_dispatcher.token_combine(
                 hidden_states,
                 combine_overlap_handle=combine_overlap_handle,
@@ -900,64 +924,78 @@ class MoELayer(nn.Layer):
         return self.unpermute(expert_outs)
 
     def _maybe_pre_allgather_overlap(self, hidden_states: paddle.Tensor):
-        """Pre-issue async AllGather on comm stream to overlap with gate MLP.
+        """Pre-issue the flat EP token AllGather on the comm stream, before the gate.
 
-        allgather + EP>1 + moe_allgather_gate_overlap only. Result consumed
-        in dispatch_preprocess. For latent MoE, fc1_latent_proj is hoisted
-        here so AllGather targets latent-space tensor.
+        Needs ``moe_allgather_gate_overlap``, EP>1 and the 'allgather'
+        dispatcher, whose ``dispatch_preprocess`` is what consumes the handle.
+        'ringmoe' deliberately does not prefetch: the only thing it could hide
+        behind the gate is round 0's intra-node AllGather, and issuing that on
+        the comm stream ahead of time cost more in contention with the
+        inter-node shift than the gate was worth. Only the tokens can be
+        prefetched; the routing idx/weight AllGathers need the gate output.
+
+        For latent MoE, ``fc1_latent_proj`` is hoisted here so the AllGather runs
+        in latent space; ``_project_to_latent`` reuses it via
+        ``self._latent_hidden``.
         """
-        if (
-            self.moe_token_dispatcher_type == "allgather"
-            and self.expert_model_parallel_size > 1
+        if not (
+            self.expert_model_parallel_size > 1
             and self.moe_allgather_gate_overlap
+            and self.moe_token_dispatcher_type == "allgather"
         ):
-            if self.use_latent_moe:
-                self._latent_hidden = self.fc1_latent_proj(hidden_states)
-                self.token_dispatcher.pre_allgather(self._latent_hidden)
-            else:
-                self._latent_hidden = None
-                self.token_dispatcher.pre_allgather(hidden_states)
+            self._latent_hidden = None
+            return
+        if self.use_latent_moe:
+            self._latent_hidden = self.fc1_latent_proj(hidden_states)
+            self.token_dispatcher.pre_allgather(self._latent_hidden)
         else:
             self._latent_hidden = None
+            self.token_dispatcher.pre_allgather(hidden_states)
 
-    def _validate_allgather_config(self):
-        """Validate and force-correct config flags for the allgather dispatcher.
+    def _validate_intermediate_ep_sharding_config(self):
+        """Validate and force-correct config flags for intermediate-EP sharding.
 
-        AllGather + ReduceScatter EP pattern: every expert is sharded along its
-        intermediate dim across the EP group.  Requires SonicMoE fused kernels;
-        fp8 dispatch quantization is handled by ``AllGatherTokenDispatcher``
+        Shared by the 'allgather' and 'ringmoe' dispatchers: every expert is
+        sharded along its intermediate dim across the EP group, so every rank
+        holds all experts.  Requires SonicMoE fused kernels; fp8 dispatch
+        quantization is handled by ``AllGatherTokenDispatcher``
         (see ``_quantize_and_pack_fp8``) and fp8 expert compute by
-        ``run_sonic_moe``.
+        ``run_sonic_moe``.  Messages name the configured dispatcher so the
+        offending yaml key is obvious.
         """
+        dispatcher = self.moe_token_dispatcher_type
         if not self.using_sonic_moe:
             raise ValueError(
-                "moe_token_dispatcher_type='allgather' requires "
-                "using_sonic_moe=True; the allgather path is only "
+                f"moe_token_dispatcher_type='{dispatcher}' requires "
+                "using_sonic_moe=True; intermediate-EP sharding is only "
                 "implemented for SonicMoE fused kernels."
             )
         if not self.moe_use_fusion_node:
             logger.warning(
-                "moe_token_dispatcher_type='allgather' only "
-                "support moe_use_fusion_node; forcing moe_use_fusion_node=True."
+                "moe_token_dispatcher_type='%s' only "
+                "support moe_use_fusion_node; forcing moe_use_fusion_node=True.",
+                dispatcher,
             )
             self.moe_use_fusion_node = True
         if not self.moe_expert_fusion:
             logger.warning(
-                "moe_token_dispatcher_type='allgather' requires "
-                "fused expert weights; forcing moe_expert_fusion=True."
+                "moe_token_dispatcher_type='%s' requires "
+                "fused expert weights; forcing moe_expert_fusion=True.",
+                dispatcher,
             )
             self.moe_expert_fusion = True
         if self.moe_deep_gemm:
             logger.warning(
-                "moe_token_dispatcher_type='allgather' does not "
-                "support moe_deep_gemm; forcing moe_deep_gemm=False."
+                "moe_token_dispatcher_type='%s' does not "
+                "support moe_deep_gemm; forcing moe_deep_gemm=False.",
+                dispatcher,
             )
             self.moe_deep_gemm = False
         if self.moe_intermediate_size % self.expert_model_parallel_size != 0:
             raise ValueError(
                 f"moe_intermediate_size={self.moe_intermediate_size} "
                 f"must be divisible by EP="
-                f"{self.expert_model_parallel_size} in 'allgather' mode."
+                f"{self.expert_model_parallel_size} in '{dispatcher}' mode."
             )
         if self.fp8:
             intermediate_per_rank = (
@@ -965,7 +1003,7 @@ class MoELayer(nn.Layer):
             )
             if intermediate_per_rank % 128 != 0:
                 raise ValueError(
-                    f"allgather + fp8 requires "
+                    f"{dispatcher} + fp8 requires "
                     f"moe_intermediate_size / EP to be divisible by 128 "
                     f"(fp8 block-scale tile), got "
                     f"moe_intermediate_size={self.moe_intermediate_size}, "
@@ -1184,6 +1222,68 @@ class MoELayer(nn.Layer):
                 hidden_states = self.latent_norm(hidden_states)
             hidden_states = self.fc2_latent_proj(hidden_states)
 
+        return hidden_states
+
+    def ringmoe_forward(
+        self,
+        hidden_states: paddle.Tensor,
+        probs: paddle.Tensor,
+        routing_map: paddle.Tensor,
+        topk_weights: paddle.Tensor | None = None,
+        topk_indices: paddle.Tensor | None = None,
+        combine_overlap_handle: dict | None = None,
+    ):
+        """MoE forward on the two-level ring dispatcher (bf16 + SonicMoE).
+
+        Standalone path: instead of the flat dispatch/compute/combine pipeline it
+        drives ``RingMoETokenDispatcher.ring_forward`` around the SonicMoE expert
+        GEMM. The latent projection is applied here, as in ``fusion_moe_forward``,
+        so the ring runs in latent space; the output is projected back after.
+
+        ``combine_overlap_handle``, when given, is consumed at the tail of
+        ``ring_forward``: the shared-expert subgraph runs on the calc stream while
+        the final inter-node ReduceScatter is in flight, and its result is written
+        back into the handle as ``fn_out`` for the caller to add in.
+        """
+        if not self.using_sonic_moe:
+            raise ValueError(
+                "moe_token_dispatcher_type='ringmoe' requires using_sonic_moe=True."
+            )
+        hidden_states = self._project_to_latent(hidden_states)
+
+        should_log_balance = framework._dygraph_tracer()._has_grad
+        if should_log_balance and global_moe_balance_training_logs_enabled():
+            # The ring never materializes the flat global index list, so ask the
+            # dispatcher for the EP-summed histogram instead.
+            log_moe_balance(
+                self.layer_number,
+                self.moe_group,
+                self.num_experts_per_tok,
+                self.token_dispatcher.global_tokens_per_expert(topk_indices),
+                is_mtp_layer=self.is_mtp_layer,
+            )
+
+        # One scope for the whole ring: it interleaves the rounds' collectives
+        # with their GEMMs, so there is no point where dispatch ends and combine
+        # begins. Compare against dispatch + fusion_mlp + combine on the other
+        # dispatchers. ``fusion_mlp`` is timed inside (see _node_slice), so
+        # ringmoe - fusion_mlp is the ring's exposed communication.
+        with profile("ringmoe"):
+            hidden_states = self.token_dispatcher.ring_forward(
+                hidden_states,
+                topk_weights,
+                topk_indices,
+                self.grouped_gemm_experts,
+                probs.dtype,
+                recompute_moe_gate_up=self.recompute_moe_gate_up,
+                combine_overlap_handle=combine_overlap_handle,
+            )
+
+        # Latent MoE: project back from latent space to hidden_size
+        if self.use_latent_moe:
+            if self.latent_norm is not None:
+                hidden_states = self.latent_norm(hidden_states)
+            hidden_states = self.fc2_latent_proj(hidden_states)
         return hidden_states
 
     def compute_gate(
@@ -1499,7 +1599,16 @@ class MoELayer(nn.Layer):
 
         expert_input = self._prepare_expert_input(_hs_dispatcher_path, residual)
         if self.expert_model_parallel_size > 1:
-            if self.moe_use_fusion_node:
+            if self.use_ring_moe:
+                output = self.ringmoe_forward(
+                    expert_input,
+                    probs,
+                    mask,
+                    topk_weights=topk_weights,
+                    topk_indices=topk_indices,
+                    combine_overlap_handle=combine_overlap_handle,
+                )
+            elif self.moe_use_fusion_node:
                 output = self.fusion_moe_forward(
                     expert_input,
                     probs,
