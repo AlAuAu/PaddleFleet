@@ -18,16 +18,21 @@ Two properties are pinned here, both bitwise (``assert_array_equal`` plus a dtyp
 check):
 
 * the node returns exactly what the plain composition returns -- same forward
-  outputs, same parameter gradients, same ``dx`` -- with and without
-  ``_widen_in_kernel``. It tracks ``high_precision_mhc`` in production, and
-  ``TransformerConfig`` rejects ``high_precision_mhc=False`` outright, so it is
-  forced apart here: the reference reads it as its own condition, and with it
-  off ``forward`` also takes the up-cast in front of the node;
+  outputs, same parameter gradients, same ``dx``;
 * replaying the module under ``RecomputeWithoutOutput`` gives bit-identical
   gradients. That is the whole reason the node exists: ``x`` feeds both the
   mapping head and the aggregation, and leaving the order of the two ``dx``
   contributions to the engine makes the sum depend on whether the segment was
   replayed.
+
+Both are checked for the native op composition and, where cuTile is available,
+for the fused kernels: the node sits in ``forward``, above that choice, so
+neither implementation may notice it. Only the fused path can vary
+``_widen_in_kernel`` -- it tracks ``high_precision_mhc`` in production and
+``TransformerConfig`` rejects ``high_precision_mhc=False`` outright, so it is
+forced apart there: the reference reads it as its own condition, and with it off
+``forward`` also takes the up-cast in front of the node. The native path pins it
+to False itself, having no widening to absorb.
 
 Both comparisons drive the real ``forward``; the reference is obtained by
 swapping the node out for a direct call to the two methods it wraps, so nothing
@@ -56,22 +61,27 @@ C = 64
 N_STREAMS = 4
 S, B = 3, 2
 
+_NEEDS_CUTILE = unittest.skipUnless(
+    _CUTILE_AVAILABLE, "fused mHC kernels require cuTile"
+)
 
-def _make_module(widen_in_kernel=True):
+
+def _make_module(use_fused_mhc=True, widen_in_kernel=None):
     config = TransformerConfig(
         hidden_size=C,
         enable_hyper_connections=True,
-        use_fused_mhc=True,
+        use_fused_mhc=use_fused_mhc,
         high_precision_mhc=True,
         num_residual_streams=N_STREAMS,
         params_dtype=paddle.bfloat16,
     )
     module = HyperConnectionModule(config, 0)
     module.train()
-    # ``_widen_in_kernel`` tracks ``high_precision_mhc``, which the config
-    # forces to True; overriding it is the only way to reach the branches that
-    # read it on its own.
-    module._widen_in_kernel = widen_in_kernel
+    if widen_in_kernel is not None:
+        # ``_widen_in_kernel`` tracks ``high_precision_mhc``, which the config
+        # forces to True; overriding it is the only way to reach the branches
+        # that read it on its own.
+        module._widen_in_kernel = widen_in_kernel
     return module
 
 
@@ -160,9 +170,8 @@ def _pipeline(module, x, replay):
     return (output,)
 
 
-@unittest.skipUnless(_CUTILE_AVAILABLE, "fused mHC kernels require cuTile")
-class TestFusedMhcMappings(unittest.TestCase):
-    """The fused mappings node must be invisible from outside ``forward``."""
+class TestMhcFixedOrderMappings(unittest.TestCase):
+    """The fixed-order node must be invisible from outside ``forward``."""
 
     @classmethod
     def setUpClass(cls):
@@ -192,34 +201,48 @@ class TestFusedMhcMappings(unittest.TestCase):
         self.assertEqual(dx_a.dtype, dx_b.dtype, f"{label}: dx dtype")
         np.testing.assert_array_equal(dx_a, dx_b, err_msg=f"{label}: dx")
 
-    def _assert_matches_reference(self, widen_in_kernel):
+    def _assert_matches_reference(self, use_fused_mhc, widen_in_kernel=None):
         paddle.seed(2026)
-        module = _make_module(widen_in_kernel)
+        module = _make_module(use_fused_mhc, widen_in_kernel)
         x = paddle.randn([S, B, N_STREAMS * C]).astype("bfloat16")
         self._assert_identical(
             _collect(module, x, _reference),
             _collect(module, x, _plain),
-            f"widen_in_kernel={widen_in_kernel}",
+            f"fused={use_fused_mhc} widen_in_kernel={module._widen_in_kernel}",
         )
 
-    def test_matches_reference_widen_in_kernel(self):
-        """The production setting: casts folded into the kernels."""
-        self._assert_matches_reference(True)
-
-    def test_matches_reference_no_widen_in_kernel(self):
-        """The caller materializes the fp32 copies instead."""
-        self._assert_matches_reference(False)
-
-    def test_recompute_replay_is_bitwise_identical(self):
-        """Replaying the module must not change a single bit of the gradients."""
+    def _assert_replay_matches(self, use_fused_mhc):
         paddle.seed(2026)
-        module = _make_module()
+        module = _make_module(use_fused_mhc)
         x = paddle.randn([S, B, N_STREAMS * C]).astype("bfloat16")
         self._assert_identical(
             _collect(module, x, lambda m, t: _pipeline(m, t, replay=False)),
             _collect(module, x, lambda m, t: _pipeline(m, t, replay=True)),
-            "recompute off vs on",
+            f"recompute off vs on, fused={use_fused_mhc}",
         )
+
+    def test_matches_reference_native(self):
+        """The op composition, which needs no kernels to run."""
+        self._assert_matches_reference(False)
+
+    def test_recompute_replay_is_bitwise_identical_native(self):
+        """Replaying must not change a bit, kernels or no kernels."""
+        self._assert_replay_matches(False)
+
+    @_NEEDS_CUTILE
+    def test_matches_reference_fused_widen_in_kernel(self):
+        """The production setting: casts folded into the kernels."""
+        self._assert_matches_reference(True, widen_in_kernel=True)
+
+    @_NEEDS_CUTILE
+    def test_matches_reference_fused_no_widen_in_kernel(self):
+        """The caller materializes the fp32 copies instead."""
+        self._assert_matches_reference(True, widen_in_kernel=False)
+
+    @_NEEDS_CUTILE
+    def test_recompute_replay_is_bitwise_identical_fused(self):
+        """Replaying the module must not change a single bit of the gradients."""
+        self._assert_replay_matches(True)
 
 
 if __name__ == "__main__":
