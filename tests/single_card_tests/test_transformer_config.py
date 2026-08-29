@@ -14,6 +14,7 @@
 
 import importlib
 import math
+import subprocess
 import sys
 import types
 import unittest
@@ -28,6 +29,62 @@ from paddlefleet.transformer.transformer_config import TransformerConfig
 
 strategy = paddle.distributed.fleet.DistributedStrategy()
 initialize_fleet(strategy=strategy)
+
+
+class TestP2POverlapDwCalcValidation(unittest.TestCase):
+    def test_unknown_point_raises_value_error_with_details(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"unknown p2p_overlap_dw_calc entries \['not_a_real_point'\]",
+        ) as context:
+            TransformerConfig(p2p_overlap_dw_calc=["not_a_real_point"])
+        self.assertIn("attn_q_proj", str(context.exception))
+
+    def test_unknown_point_raises_under_python_optimize(self):
+        code = """
+from paddlefleet.transformer.transformer_config import TransformerConfig
+
+try:
+    TransformerConfig(p2p_overlap_dw_calc=["not_a_real_point"])
+except ValueError as exc:
+    if "not_a_real_point" not in str(exc) or "attn_q_proj" not in str(exc):
+        raise RuntimeError(f"incomplete validation error: {exc}")
+else:
+    raise RuntimeError("unknown p2p_overlap_dw_calc point was accepted")
+"""
+        result = subprocess.run(
+            [sys.executable, "-O", "-c", code],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    def test_deferral_rejects_pp_without_interleaved_scheduler(self):
+        for pp, vpp in ((1, None), (2, None), (2, 1)):
+            with (
+                self.subTest(pp=pp, vpp=vpp),
+                self.assertRaisesRegex(ValueError, "virtual_pipeline"),
+            ):
+                TransformerConfig(
+                    p2p_overlap_dw_calc=["moe_expert_up_gate_proj"],
+                    pipeline_model_parallel_size=pp,
+                    virtual_pipeline_model_parallel_size=vpp,
+                )
+
+    def test_deferral_accepts_interleaved_scheduler(self):
+        config = TransformerConfig(
+            p2p_overlap_dw_calc=["moe_expert_up_gate_proj"],
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+        )
+        self.assertEqual(
+            config.p2p_overlap_dw_calc, ["moe_expert_up_gate_proj"]
+        )
 
 
 class TestMoeLayerFreqAndFirstKDenseReplace(unittest.TestCase):
