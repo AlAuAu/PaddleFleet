@@ -578,7 +578,15 @@ class TransformerConfig(ModelParallelConfig):
     attention module per microbatch (~95 us of host dispatch each for an 8192 x 64
     table), which the cache collapses to a dict lookup. Calls that pass
     ``position_ids`` are never cached -- the result then depends on a runtime
-    tensor. Off by default so the original code path is unchanged."""
+    tensor. Off by default so the original code path is unchanged.
+
+    Scope: ``RotaryEmbedding`` only, i.e. ``rope_type="rope"``.
+    ``YarnRotaryEmbedding`` overrides ``forward`` and ``MultimodalRotaryEmbedding``
+    is a separate class, so both keep the uncached path regardless of this field.
+
+    The cache is bounded (``_ROPE_EMB_CACHE_MAX_ENTRIES``, FIFO). Training uses a
+    single ``(max_seq_len, offset)`` key and always hits; incremental decode varies
+    the key, so it degrades to a miss rather than retaining a table per step."""
 
     ####################
     # fusion

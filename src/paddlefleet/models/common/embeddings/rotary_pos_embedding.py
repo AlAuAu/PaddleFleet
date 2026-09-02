@@ -31,6 +31,12 @@ from paddlefleet import parallel_state
 logger = logging.getLogger(__name__)
 
 
+# Upper bound on ``RotaryEmbedding._emb_cache`` entries. Training uses a single
+# key; the bound only matters for callers that vary ``max_seq_len`` (incremental
+# decode), where it caps retention instead of growing without limit.
+_ROPE_EMB_CACHE_MAX_ENTRIES: int = 8
+
+
 __all__ = [
     "RotaryEmbedding",
     "MultimodalRotaryEmbedding",
@@ -131,8 +137,16 @@ class RotaryEmbedding(nn.Layer):
         #
         # Per-instance, because the table also depends on ``inv_freq``. Stays
         # empty when the cache is off, and ``forward`` then runs unchanged.
+        #
+        # Bounded on purpose. Training only ever uses one key, but incremental
+        # decode does not: ``_build_rope_freqs`` asks for ``sq + position_offset``
+        # without ``position_ids``, so the key grows with the generated length and
+        # an unbounded dict would retain one 2MB table per step per layer. The
+        # bound keeps the training win (single key, always a hit) and turns decode
+        # into a cheap miss instead of an OOM.
         self.rotary_embed_cache = rotary_embed_cache
         self._emb_cache: dict[tuple[int, int], Tensor] = {}
+        self._emb_cache_max_entries = _ROPE_EMB_CACHE_MAX_ENTRIES
 
     def _apply_scaling(
         self,
@@ -268,6 +282,9 @@ class RotaryEmbedding(nn.Layer):
             # the table in place (verified: no `+=`/`copy_`/`fill_`/`scale_` on
             # the returned tensor anywhere in paddlefleet), and the recompute
             # path in transformer_layer.py already clones its inputs.
+            if len(self._emb_cache) >= self._emb_cache_max_entries:
+                # dict preserves insertion order, so this evicts the oldest.
+                del self._emb_cache[next(iter(self._emb_cache))]
             self._emb_cache[cache_key] = emb
         return emb
 
