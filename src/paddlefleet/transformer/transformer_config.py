@@ -568,6 +568,18 @@ class TransformerConfig(ModelParallelConfig):
 
     high_precision_rope: bool = False
     swa_high_precision_norm: bool = False
+
+    rotary_embed_cache: bool = False
+    """If True, ``RotaryEmbedding.forward`` memoises its angle table per
+    ``(max_seq_len, offset)``.
+
+    The table is a pure function of that key plus instance constants, so a hit is
+    bit-identical to recomputing. Training rebuilds the identical table once per
+    attention module per microbatch (~95 us of host dispatch each for an 8192 x 64
+    table), which the cache collapses to a dict lookup. Calls that pass
+    ``position_ids`` are never cached -- the result then depends on a runtime
+    tensor. Off by default so the original code path is unchanged."""
+
     ####################
     # fusion
     ####################
