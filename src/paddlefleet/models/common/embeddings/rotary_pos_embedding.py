@@ -31,10 +31,13 @@ from paddlefleet import parallel_state
 logger = logging.getLogger(__name__)
 
 
-# Upper bound on ``RotaryEmbedding._emb_cache`` entries. Training uses a single
-# key; the bound only matters for callers that vary ``max_seq_len`` (incremental
-# decode), where it caps retention instead of growing without limit.
-_ROPE_EMB_CACHE_MAX_ENTRIES: int = 8
+# ``RotaryEmbedding._emb_cache`` holds at most this many tables. One, on purpose:
+# the entry count is not the interesting bound, the retained bytes are. A 131072
+# context with rope dim 64 in float32 is a ~32MiB table, and DSv4 gives every
+# layer its own instance, so even a handful of entries per instance adds up to GBs
+# across the model. Training only ever needs one key, so a single slot is a
+# permanent hit there and costs one table per instance at worst.
+_ROPE_EMB_CACHE_MAX_ENTRIES: int = 1
 
 
 __all__ = [
@@ -140,10 +143,12 @@ class RotaryEmbedding(nn.Layer):
         #
         # Bounded on purpose. Training only ever uses one key, but incremental
         # decode does not: ``_build_rope_freqs`` asks for ``sq + position_offset``
-        # without ``position_ids``, so the key grows with the generated length and
-        # an unbounded dict would retain one 2MB table per step per layer. The
-        # bound keeps the training win (single key, always a hit) and turns decode
-        # into a cheap miss instead of an OOM.
+        # without ``position_ids``, and ``position_offset`` grows with the KV cache,
+        # so the key walks the length space. An unbounded dict -- or even a
+        # several-entry one -- would retain a full table per distinct length per
+        # instance, which at long context is tens of MiB each and GBs across the
+        # model. Holding a single slot keeps the training win (one key, permanent
+        # hit) and turns decode into a cheap miss instead of a memory leak.
         self.rotary_embed_cache = rotary_embed_cache
         self._emb_cache: dict[tuple[int, int], Tensor] = {}
         self._emb_cache_max_entries = _ROPE_EMB_CACHE_MAX_ENTRIES
@@ -282,7 +287,7 @@ class RotaryEmbedding(nn.Layer):
             # the table in place (verified: no `+=`/`copy_`/`fill_`/`scale_` on
             # the returned tensor anywhere in paddlefleet), and the recompute
             # path in transformer_layer.py already clones its inputs.
-            if len(self._emb_cache) >= self._emb_cache_max_entries:
+            while len(self._emb_cache) >= self._emb_cache_max_entries:
                 # dict preserves insertion order, so this evicts the oldest.
                 del self._emb_cache[next(iter(self._emb_cache))]
             self._emb_cache[cache_key] = emb
