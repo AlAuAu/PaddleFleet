@@ -74,7 +74,12 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         correction_range_round_to_int: bool = True,
         use_accuracy_compatible: bool = False,
         yarn_rope_fusion: bool = False,
+        rotary_embed_cache: bool = False,
     ):
+        # Deliberately not forwarded to ``super()``: this class overrides
+        # ``forward``, so the base cache would never be consulted. Accepted only
+        # so the shared ``rope_embedding`` LayerSpec can pass it uniformly.
+        del rotary_embed_cache
         self.dim = head_dim
         self.rotary_base = rotary_base
         self.scaling_factor = scaling_factor

@@ -28,6 +28,7 @@ invisible. The tests pin that down:
     a runtime tensor rather than on the key.
 """
 
+import inspect
 import unittest
 
 import numpy as np
@@ -234,6 +235,44 @@ class TestRotaryEmbedCacheBounded(unittest.TestCase):
         for _ in range(50):
             self.assertIs(rope(8192, 0), first)
         self.assertEqual(len(rope._emb_cache), 1)
+
+
+class TestRotaryEmbedCacheSignatureParity(unittest.TestCase):
+    """Every class reachable from the shared ``rope_embedding`` LayerSpec must
+    accept ``rotary_embed_cache``.
+
+    ``GPTEmbedding`` builds its RoPE through ``build_spec_layer`` and passes the
+    field unconditionally, so a sibling class missing it is a TypeError at model
+    construction (hit exactly that with MultimodalRotaryEmbedding for qwen3vl).
+    The classes that override ``forward`` accept it and ignore it.
+    """
+
+    def test_all_spec_classes_accept_the_kwarg(self) -> None:
+        from paddlefleet.models.common.embeddings.rotary_pos_embedding import (
+            MultimodalRotaryEmbedding,
+        )
+        from paddlefleet.models.common.embeddings.yarn_rotary_pos_embedding import (
+            YarnRotaryEmbedding,
+        )
+
+        for cls in (
+            RotaryEmbedding,
+            MultimodalRotaryEmbedding,
+            YarnRotaryEmbedding,
+        ):
+            with self.subTest(cls=cls.__name__):
+                params = inspect.signature(cls.__init__).parameters
+                self.assertIn("rotary_embed_cache", params)
+
+    def test_overriding_classes_do_not_enable_the_cache(self) -> None:
+        from paddlefleet.models.common.embeddings.yarn_rotary_pos_embedding import (
+            YarnRotaryEmbedding,
+        )
+
+        yarn = YarnRotaryEmbedding(
+            HEAD_DIM, rotary_base=BASE, rotary_embed_cache=True
+        )
+        self.assertFalse(yarn.rotary_embed_cache)
 
 
 if __name__ == "__main__":
