@@ -200,5 +200,41 @@ class TestRotaryEmbedCacheBackward(unittest.TestCase):
         self.assertTrue(_bits_equal(before, rope(256, 0)))
 
 
+class TestRotaryEmbedCacheBounded(unittest.TestCase):
+    """The cache must stay bounded when the key varies (incremental decode)."""
+
+    def test_growing_max_seq_len_does_not_grow_cache(self) -> None:
+        """``_build_rope_freqs`` asks for ``sq + position_offset`` without
+        ``position_ids``, so decode walks the key space. Retaining one table per
+        step would OOM; the bound must hold and the results stay correct."""
+        rope = _build(True)
+        off = _build(False)
+        for seq_len in range(1, 40):
+            got = rope(seq_len, 0)
+            self.assertTrue(_bits_equal(off(seq_len, 0), got))
+            self.assertLessEqual(
+                len(rope._emb_cache), rope._emb_cache_max_entries
+            )
+
+    def test_eviction_is_fifo(self) -> None:
+        rope = _build(True)
+        n = rope._emb_cache_max_entries
+        for seq_len in range(1, n + 1):
+            rope(seq_len, 0)
+        self.assertEqual(len(rope._emb_cache), n)
+        rope(n + 1, 0)
+        self.assertEqual(len(rope._emb_cache), n)
+        self.assertNotIn((1, 0), rope._emb_cache)
+        self.assertIn((n + 1, 0), rope._emb_cache)
+
+    def test_repeated_single_key_never_evicts(self) -> None:
+        """The training pattern: one key, unlimited hits, one entry."""
+        rope = _build(True)
+        first = rope(8192, 0)
+        for _ in range(50):
+            self.assertIs(rope(8192, 0), first)
+        self.assertEqual(len(rope._emb_cache), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
