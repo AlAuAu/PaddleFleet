@@ -88,18 +88,19 @@ class TestRotaryEmbedCache(unittest.TestCase):
         self.assertIs(first, second)
         self.assertEqual(list(rope._emb_cache), [(8192, 0)])
 
-    def test_distinct_keys_get_distinct_entries(self) -> None:
+    def test_distinct_keys_are_not_confused(self) -> None:
+        """Only one table is retained, but a different key must never be served
+        the previous one."""
         rope = _build(True)
         a = rope(8192, 0)
         b = rope(4096, 0)
         c = rope(8192, 7)
-        self.assertEqual(
-            sorted(rope._emb_cache), [(4096, 0), (8192, 0), (8192, 7)]
-        )
         self.assertIsNot(a, b)
         self.assertIsNot(a, c)
         self.assertEqual(a.shape[1], 8192)
         self.assertEqual(b.shape[1], 4096)
+        off = _build(False)
+        self.assertTrue(_bits_equal(off(8192, 7), c))
 
     def test_forward_bit_exact(self) -> None:
         off, on = _build(False), _build(True)
@@ -217,16 +218,16 @@ class TestRotaryEmbedCacheBounded(unittest.TestCase):
                 len(rope._emb_cache), rope._emb_cache_max_entries
             )
 
-    def test_eviction_is_fifo(self) -> None:
+    def test_only_the_latest_key_is_retained(self) -> None:
+        """One slot: a table is tens of MiB at long context and every layer owns
+        an instance, so more than one entry per instance would cost GBs."""
         rope = _build(True)
-        n = rope._emb_cache_max_entries
-        for seq_len in range(1, n + 1):
-            rope(seq_len, 0)
-        self.assertEqual(len(rope._emb_cache), n)
-        rope(n + 1, 0)
-        self.assertEqual(len(rope._emb_cache), n)
-        self.assertNotIn((1, 0), rope._emb_cache)
-        self.assertIn((n + 1, 0), rope._emb_cache)
+        self.assertEqual(rope._emb_cache_max_entries, 1)
+        rope(16, 0)
+        rope(32, 0)
+        self.assertEqual(list(rope._emb_cache), [(32, 0)])
+        rope(64, 7)
+        self.assertEqual(list(rope._emb_cache), [(64, 7)])
 
     def test_repeated_single_key_never_evicts(self) -> None:
         """The training pattern: one key, unlimited hits, one entry."""

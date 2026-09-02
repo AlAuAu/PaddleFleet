@@ -564,9 +564,12 @@ class TransformerConfig(ModelParallelConfig):
     ``YarnRotaryEmbedding`` overrides ``forward`` and ``MultimodalRotaryEmbedding``
     is a separate class, so both keep the uncached path regardless of this field.
 
-    The cache is bounded (``_ROPE_EMB_CACHE_MAX_ENTRIES``, FIFO). Training uses a
-    single ``(max_seq_len, offset)`` key and always hits; incremental decode varies
-    the key, so it degrades to a miss rather than retaining a table per step."""
+    The cache holds a single table (``_ROPE_EMB_CACHE_MAX_ENTRIES``). Training uses
+    one ``(max_seq_len, offset)`` key and therefore always hits. Incremental decode
+    varies the key -- ``position_offset`` grows with the KV cache -- so it degrades
+    to a miss; that is deliberate, because a table is tens of MiB at long context
+    and every layer owns an instance, so retaining more than one per instance would
+    cost GBs across the model."""
 
     ####################
     # fusion
