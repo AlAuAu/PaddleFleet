@@ -130,10 +130,12 @@ class RotaryEmbedding(nn.Layer):
         # into a dict lookup; a hit is bit-identical to recomputing.
         #
         # Per-instance, because the table also depends on ``inv_freq``. A single
-        # slot rather than a dict: the supported callers use one key for the whole
-        # run, so a second slot would never be read, and a structure that cannot
-        # grow needs no eviction policy to keep it from growing. Stays None when
-        # the cache is off, and ``forward`` then runs unchanged.
+        # slot rather than a dict: the training path keeps one key for the whole run,
+        # so the slot is a permanent hit there. A caller that varies the key --
+        # incremental decode, whose ``sq + position_offset`` grows with the KV cache
+        # -- just replaces the slot and keeps missing, so what is retained is bounded
+        # by construction and no eviction policy is needed. Stays None when the cache
+        # is off, and ``forward`` then runs unchanged.
         self.rotary_embed_cache = rotary_embed_cache
         self._emb_cache_key: tuple[int, int] | None = None
         self._emb_cache_value: Tensor | None = None
