@@ -593,10 +593,12 @@ class TransformerConfig(ModelParallelConfig):
     ``MultimodalRotaryEmbedding`` override ``forward`` outright and are likewise out
     of scope.
 
-    The memo is a single slot, not a dict: the supported callers use one
-    ``(max_seq_len, offset)`` key for the whole run, so it is a permanent hit and a
-    second slot would never be read. A caller that varied the key would simply keep
-    missing, which is why no eviction policy is needed to bound what is retained."""
+    The memo is a single slot, not a dict. On the training path the key is fixed --
+    that is where the win comes from, and the slot is a permanent hit. Callers that
+    vary the key get no benefit: incremental decode reaches ``_build_rope_freqs``'s
+    ``sq + position_offset`` form, whose key grows with the KV cache, so every step
+    replaces the slot and misses. That is why one slot is enough -- what it holds is
+    bounded by construction, without an eviction policy."""
 
     ####################
     # fusion
