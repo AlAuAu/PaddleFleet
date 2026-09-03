@@ -70,13 +70,13 @@ class TestRotaryEmbedCache(unittest.TestCase):
         self.assertFalse(rope.rotary_embed_cache)
         rope(8192, 0)
         rope(8192, 0)
-        self.assertEqual(len(rope._emb_cache), 0)
+        self.assertIsNone(rope._emb_cache_key)
 
     def test_off_does_not_cache(self) -> None:
         rope = _build(False)
         first = rope(8192, 0)
         second = rope(8192, 0)
-        self.assertEqual(len(rope._emb_cache), 0)
+        self.assertIsNone(rope._emb_cache_key)
         self.assertIsNot(first, second)
         self.assertTrue(_bits_equal(first, second))
 
@@ -85,7 +85,7 @@ class TestRotaryEmbedCache(unittest.TestCase):
         first = rope(8192, 0)
         second = rope(8192, 0)
         self.assertIs(first, second)
-        self.assertEqual(list(rope._emb_cache), [(8192, 0)])
+        self.assertEqual(rope._emb_cache_key, (8192, 0))
 
     def test_distinct_keys_are_not_confused(self) -> None:
         """Only one table is retained, but a different key must never be served
@@ -127,7 +127,7 @@ class TestRotaryEmbedCache(unittest.TestCase):
         position_ids = paddle.arange(128)
         first = rope(128, 0, position_ids=position_ids)
         second = rope(128, 0, position_ids=position_ids)
-        self.assertEqual(len(rope._emb_cache), 0)
+        self.assertIsNone(rope._emb_cache_key)
         self.assertIsNot(first, second)
         self.assertTrue(_bits_equal(first, second))
 
@@ -213,20 +213,16 @@ class TestRotaryEmbedCacheBounded(unittest.TestCase):
         for seq_len in range(1, 40):
             got = rope(seq_len, 0)
             self.assertTrue(_bits_equal(off(seq_len, 0), got))
-            self.assertLessEqual(
-                len(rope._emb_cache), rope._emb_cache_max_entries
-            )
+            self.assertEqual(rope._emb_cache_key, (seq_len, 0))
 
     def test_only_the_latest_key_is_retained(self) -> None:
-        """One slot: a table is tens of MiB at long context and every layer owns
-        an instance, so more than one entry per instance would cost GBs."""
+        """A single slot cannot accumulate tables, whatever the caller asks for."""
         rope = _build(True)
-        self.assertEqual(rope._emb_cache_max_entries, 1)
         rope(16, 0)
         rope(32, 0)
-        self.assertEqual(list(rope._emb_cache), [(32, 0)])
+        self.assertEqual(rope._emb_cache_key, (32, 0))
         rope(64, 7)
-        self.assertEqual(list(rope._emb_cache), [(64, 7)])
+        self.assertEqual(rope._emb_cache_key, (64, 7))
 
     def test_repeated_single_key_never_evicts(self) -> None:
         """The training pattern: one key, unlimited hits, one entry."""
@@ -234,7 +230,7 @@ class TestRotaryEmbedCacheBounded(unittest.TestCase):
         first = rope(8192, 0)
         for _ in range(50):
             self.assertIs(rope(8192, 0), first)
-        self.assertEqual(len(rope._emb_cache), 1)
+        self.assertEqual(rope._emb_cache_key, (8192, 0))
 
 
 if __name__ == "__main__":
