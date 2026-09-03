@@ -580,9 +580,18 @@ class TransformerConfig(ModelParallelConfig):
     ``position_ids`` are never cached -- the result then depends on a runtime
     tensor. Off by default so the original code path is unchanged.
 
-    Scope: ``RotaryEmbedding`` only, i.e. ``rope_type="rope"``.
-    ``YarnRotaryEmbedding`` overrides ``forward`` and ``MultimodalRotaryEmbedding``
-    is a separate class, so both keep the uncached path regardless of this field.
+    Scope, on purpose: the ``RotaryEmbedding`` instances that attention layers own
+    -- MLA (``multi_latent_attention.py``), DSv4 hybrid (``dsv4_hybrid_attention.py``)
+    and the DSA indexer (``dsa_attention.py``). Those are the ones that rebuild the
+    table, because every layer holds its own instance and calls it once per
+    microbatch; a 44-layer model does that a few hundred times per step.
+
+    Deliberately *not* wired into ``GPTEmbedding``: models that take that path build
+    one table per forward at the embedding stage and pass it down through
+    ``dict_args``, so there is no repeated rebuild to remove and caching would add
+    surface without a measurable win. ``YarnRotaryEmbedding`` and
+    ``MultimodalRotaryEmbedding`` override ``forward`` outright and are likewise out
+    of scope.
 
     The cache holds a single table (``_ROPE_EMB_CACHE_MAX_ENTRIES``). Training uses
     one ``(max_seq_len, offset)`` key and therefore always hits. Incremental decode

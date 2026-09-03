@@ -130,7 +130,6 @@ class GPTEmbedding(FleetLayer):
                 use_accuracy_compatible=getattr(
                     config, "use_accuracy_compatible", False
                 ),
-                rotary_embed_cache=getattr(config, "rotary_embed_cache", False),
             )
 
             if config.sliding_window is not None:
@@ -147,9 +146,6 @@ class GPTEmbedding(FleetLayer):
                     rotary_interleaved=config.rotary_interleaved,
                     rotary_base=swa_rotary_base,
                     rope_scaling=rope_scaling,
-                    rotary_embed_cache=getattr(
-                        config, "rotary_embed_cache", False
-                    ),
                 )
 
     @property
