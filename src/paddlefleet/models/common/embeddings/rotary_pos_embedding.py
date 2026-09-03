@@ -31,15 +31,6 @@ from paddlefleet import parallel_state
 logger = logging.getLogger(__name__)
 
 
-# ``RotaryEmbedding._emb_cache`` holds at most this many tables. One, on purpose:
-# the entry count is not the interesting bound, the retained bytes are. A 131072
-# context with rope dim 64 in float32 is a ~32MiB table, and DSv4 gives every
-# layer its own instance, so even a handful of entries per instance adds up to GBs
-# across the model. Training only ever needs one key, so a single slot is a
-# permanent hit there and costs one table per instance at worst.
-_ROPE_EMB_CACHE_MAX_ENTRIES: int = 1
-
-
 __all__ = [
     "RotaryEmbedding",
     "MultimodalRotaryEmbedding",
@@ -138,20 +129,14 @@ class RotaryEmbedding(nn.Layer):
         # the GPU finishes in ~1-2 us. Enabling the cache turns the whole chain
         # into a dict lookup; a hit is bit-identical to recomputing.
         #
-        # Per-instance, because the table also depends on ``inv_freq``. Stays
-        # empty when the cache is off, and ``forward`` then runs unchanged.
-        #
-        # Bounded on purpose. Training only ever uses one key, but incremental
-        # decode does not: ``_build_rope_freqs`` asks for ``sq + position_offset``
-        # without ``position_ids``, and ``position_offset`` grows with the KV cache,
-        # so the key walks the length space. An unbounded dict -- or even a
-        # several-entry one -- would retain a full table per distinct length per
-        # instance, which at long context is tens of MiB each and GBs across the
-        # model. Holding a single slot keeps the training win (one key, permanent
-        # hit) and turns decode into a cheap miss instead of a memory leak.
+        # Per-instance, because the table also depends on ``inv_freq``. A single
+        # slot rather than a dict: the supported callers use one key for the whole
+        # run, so a second slot would never be read, and a structure that cannot
+        # grow needs no eviction policy to keep it from growing. Stays None when
+        # the cache is off, and ``forward`` then runs unchanged.
         self.rotary_embed_cache = rotary_embed_cache
-        self._emb_cache: dict[tuple[int, int], Tensor] = {}
-        self._emb_cache_max_entries = _ROPE_EMB_CACHE_MAX_ENTRIES
+        self._emb_cache_key: tuple[int, int] | None = None
+        self._emb_cache_value: Tensor | None = None
 
     def _apply_scaling(
         self,
@@ -264,9 +249,8 @@ class RotaryEmbedding(nn.Layer):
         cache_key = None
         if self.rotary_embed_cache and position_ids is None:
             cache_key = (int(max_seq_len), int(offset))
-            cached = self._emb_cache.get(cache_key)
-            if cached is not None:
-                return cached
+            if cache_key == self._emb_cache_key:
+                return self._emb_cache_value
 
         freqs = self.get_freqs_non_repeated(
             max_seq_len, offset, position_ids=position_ids
@@ -287,10 +271,8 @@ class RotaryEmbedding(nn.Layer):
             # the table in place (verified: no `+=`/`copy_`/`fill_`/`scale_` on
             # the returned tensor anywhere in paddlefleet), and the recompute
             # path in transformer_layer.py already clones its inputs.
-            while len(self._emb_cache) >= self._emb_cache_max_entries:
-                # dict preserves insertion order, so this evicts the oldest.
-                del self._emb_cache[next(iter(self._emb_cache))]
-            self._emb_cache[cache_key] = emb
+            self._emb_cache_key = cache_key
+            self._emb_cache_value = emb
         return emb
 
     def get_rotary_seq_len(

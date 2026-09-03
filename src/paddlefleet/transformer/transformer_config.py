@@ -593,12 +593,10 @@ class TransformerConfig(ModelParallelConfig):
     ``MultimodalRotaryEmbedding`` override ``forward`` outright and are likewise out
     of scope.
 
-    The cache holds a single table (``_ROPE_EMB_CACHE_MAX_ENTRIES``). Training uses
-    one ``(max_seq_len, offset)`` key and therefore always hits. Incremental decode
-    varies the key -- ``position_offset`` grows with the KV cache -- so it degrades
-    to a miss; that is deliberate, because a table is tens of MiB at long context
-    and every layer owns an instance, so retaining more than one per instance would
-    cost GBs across the model."""
+    The memo is a single slot, not a dict: the supported callers use one
+    ``(max_seq_len, offset)`` key for the whole run, so it is a permanent hit and a
+    second slot would never be read. A caller that varied the key would simply keep
+    missing, which is why no eviction policy is needed to bound what is retained."""
 
     ####################
     # fusion
