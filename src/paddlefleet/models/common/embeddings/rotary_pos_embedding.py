@@ -363,14 +363,8 @@ class MultimodalRotaryEmbedding(nn.Layer):
         rope_scaling: bool = False,
         cp_group: paddle.distributed.communication.group.Group | None = None,
         use_accuracy_compatible: bool = False,
-        rotary_embed_cache: bool = False,
     ) -> None:
         super().__init__()
-        # Accepted for signature parity with ``RotaryEmbedding`` -- the shared
-        # ``rope_embedding`` LayerSpec passes it to whichever class is configured
-        # -- but unused: this class overrides ``forward``, and its table depends
-        # on the runtime ``position_ids`` rather than on (max_seq_len, offset).
-        del rotary_embed_cache
 
         if rotary_percent < 1.0:
             head_dim = int(head_dim * rotary_percent)
